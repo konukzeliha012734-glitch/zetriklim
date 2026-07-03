@@ -1,0 +1,9 @@
+# Bu dosyayı secrets.toml adıyla kopyalamayın ve GitHub'a yüklemeyin.
+# Değerleri Streamlit Community Cloud > App settings > Secrets alanına girin.
+GOOGLE_EARTH_ENGINE_PROJECT = "your-google-cloud-project-id"
+
+[gee]
+service_account = "zetriklim@your-google-cloud-project-id.iam.gserviceaccount.com"
+private_key = """-----BEGIN PRIVATE KEY-----
+YOUR_PRIVATE_KEY
+-----END PRIVATE KEY-----"""
