@@ -10,6 +10,8 @@ import re
 import folium
 import pandas as pd
 import streamlit as st
+from branca.colormap import LinearColormap, StepColormap
+from folium import plugins
 from streamlit_folium import st_folium
 
 from zetriklim.catalog import ANALYSES, ANALYSIS_METHODS, SOURCES, VARIABLES
@@ -69,6 +71,76 @@ if access_code and not st.session_state.get("access_granted"):
 
 def cached_gee_status(project: str | None) -> tuple[bool, str]:
     return initialize_gee(project)
+
+
+def add_cartographic_controls(
+    fmap: folium.Map,
+    analysis: str,
+    source: str,
+    start_date,
+    end_date,
+) -> None:
+    """Analiz haritasına CBS lejantı, ölçek, koordinat ve kuzey oku ekler."""
+    styles = {
+        "NDVI": StepColormap(
+            ["#3b6fb6", "#c9b28f", "#f0dc65", "#88c96b", "#187a3d"],
+            index=[-1.0, 0.0, 0.2, 0.4, 0.6, 1.0],
+            vmin=-1.0,
+            vmax=1.0,
+            caption="NDVI: su/gölge ← düşük bitki örtüsü → yoğun bitki örtüsü",
+        ),
+        "EVI": StepColormap(
+            ["#5b4b8a", "#d8c6a3", "#f0dc65", "#78c679", "#006837"],
+            index=[-1.0, 0.0, 0.2, 0.4, 0.6, 1.0],
+            vmin=-1.0,
+            vmax=1.0,
+            caption="EVI: düşük ← bitki canlılığı → yüksek",
+        ),
+        "SPI": StepColormap(
+            ["#8b1a1a", "#d6604d", "#f4a582", "#f7f7f7", "#92c5de", "#4393c3", "#2166ac"],
+            index=[-3.0, -2.0, -1.5, -1.0, 1.0, 1.5, 2.0, 3.0],
+            vmin=-3.0,
+            vmax=3.0,
+            caption="SPI: aşırı kurak ← normal → aşırı nemli",
+        ),
+        "LST": LinearColormap(
+            ["#313695", "#74add1", "#ffffbf", "#f46d43", "#a50026"],
+            vmin=-10,
+            vmax=50,
+            caption="Arazi yüzey sıcaklığı (°C): düşük → yüksek",
+        ),
+    }
+    colormap = styles.get(analysis)
+    if colormap is not None:
+        colormap.add_to(fmap)
+    plugins.Fullscreen(
+        position="topleft",
+        title="Tam ekran",
+        title_cancel="Tam ekrandan çık",
+        force_separate_button=True,
+    ).add_to(fmap)
+    plugins.MousePosition(
+        position="bottomright",
+        separator=" · ",
+        prefix="Koordinat",
+        num_digits=5,
+    ).add_to(fmap)
+    north_arrow = """
+    <div style="position:fixed;right:18px;top:85px;z-index:9999;background:white;
+    border:1px solid #315b64;border-radius:8px;padding:5px 8px;text-align:center;
+    box-shadow:0 2px 8px rgba(0,0,0,.16);font:700 13px sans-serif;color:#063447">
+      N<br><span style="font-size:24px;line-height:20px">↑</span>
+    </div>
+    """
+    title_box = f"""
+    <div style="position:fixed;left:52px;top:10px;z-index:9999;background:rgba(255,255,255,.94);
+    border-left:4px solid #00a6a6;border-radius:6px;padding:7px 11px;
+    box-shadow:0 2px 8px rgba(0,0,0,.12);font:12px sans-serif;color:#063447">
+      <b>{analysis} mekânsal analiz haritası</b><br>
+      Kaynak: {source}<br>Dönem: {start_date} – {end_date}
+    </div>
+    """
+    fmap.get_root().html.add_child(folium.Element(north_arrow + title_box))
 
 st.markdown(
     """
@@ -1098,7 +1170,12 @@ with tab_output:
                                 ce_variable_ids,
                                 selected_analysis,
                             )
-                            ce_map = folium.Map(summary.centroid, zoom_start=8, tiles="CartoDB positron")
+                            ce_map = folium.Map(
+                                summary.centroid,
+                                zoom_start=8,
+                                tiles="CartoDB positron",
+                                control_scale=True,
+                            )
                             folium.TileLayer(
                                 tiles=climate_engine_tile_url,
                                 attr="Climate Engine / Google Earth Engine",
@@ -1118,6 +1195,13 @@ with tab_output:
                             ).add_to(ce_map)
                             bounds = summary.bounds
                             ce_map.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
+                            add_cartographic_controls(
+                                ce_map,
+                                selected_analysis,
+                                f"Climate Engine · {ce_dataset_id}",
+                                start_date,
+                                end_date,
+                            )
                             folium.LayerControl().add_to(ce_map)
                             files[
                                 f"{selected_analysis}_ClimateEngine_etkilesimli_harita.html"
@@ -1293,6 +1377,15 @@ with tab_output:
             f"Kayıt: {len(st.session_state.get('output_data', [])):,} · "
             "İndirme hedefi: tarayıcınızın İndirilenler klasörü"
         )
+        st.subheader("Analiz zaman serisi")
+        st.image(
+            st.session_state.output_files["zaman-serisi.png"],
+            caption=(
+                f"{selected_analysis} · {start_date} – {end_date} · "
+                "NoData değerleri kalite kontrolünde grafik dışında bırakılmıştır."
+            ),
+            width="stretch",
+        )
         d1, d2, d3 = st.columns(3)
         d1.download_button(
             "Tüm paketi indir (ZIP)",
@@ -1384,6 +1477,7 @@ with tab_output:
                     summary.centroid,
                     zoom_start=8,
                     tiles="CartoDB positron",
+                    control_scale=True,
                 )
                 folium.TileLayer(
                     tiles=tile_url,
@@ -1394,15 +1488,30 @@ with tab_output:
                 ).add_to(result_map)
                 folium.GeoJson(
                     summary.gdf_wgs84.__geo_interface__,
+                    name="Çalışma alanı / havza sınırı",
                     style_function=lambda _: {
                         "color": "#052f42",
-                        "weight": 3,
-                        "fillOpacity": 0,
+                        "weight": 3.5,
+                        "fillColor": "#ffffff",
+                        "fillOpacity": 0.04,
                     },
                 ).add_to(result_map)
                 bounds = summary.bounds
                 result_map.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
+                add_cartographic_controls(
+                    result_map,
+                    selected_analysis,
+                    st.session_state.get("output_source", provider),
+                    start_date,
+                    end_date,
+                )
+                folium.LayerControl(collapsed=False).add_to(result_map)
                 st_folium(result_map, height=560, width="stretch", returned_objects=[])
+                st.caption(
+                    "Lejant renkleri analiz sınıflarını gösterir. Climate Engine rasterı "
+                    "karo servisinde dikdörtgen kapsam olarak sunulur; koyu çizgi gerçek "
+                    "çalışma alanı/havza sınırıdır."
+                )
             for index, map_name in enumerate(html_map_names):
                 st.download_button(
                     "Etkileşimli haritayı indir",
