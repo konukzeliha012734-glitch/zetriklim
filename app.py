@@ -140,22 +140,24 @@ if "uploader_nonce" not in st.session_state:
 
 top_logo, top_hero = st.columns([0.16, 0.84], vertical_alignment="center")
 with top_logo:
-    st.markdown(
-        """
-        <div style="text-align:center;padding:1rem .4rem">
-          <div style="font-size:2.2rem;font-weight:900;color:#075b68;letter-spacing:.08em">Z</div>
-          <div style="font-size:1rem;font-weight:850;color:#063447;letter-spacing:.12em">ZETRİKLİM</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.image(str(LOGO), width=150)
 with top_hero:
     st.markdown(
         """
         <section class="hero">
-          <h1>Havzanı tanımla, iklim ve çevresel değişimi birlikte analiz et.</h1>
-          <p>Çalışma alanını yükle; veri kaynağını, inceleme dönemini ve analiz yöntemlerini seç.
-          Zetriklim sonuçlarını harita, GeoTIFF, Excel ve CBS'ye hazır proje paketi olarak oluştursun.</p>
+          <div style="font-size:.76rem;font-weight:800;letter-spacing:.14em;color:#ffd67a">
+            HAVZA · İKLİM · UZAKTAN ALGILAMA
+          </div>
+          <h1>Coğrafi sınırını tanımla, değişimi mekânsal olarak çözümle.</h1>
+          <p>Doğrulanmış açık veri kaynaklarından seçilen döneme ve analize uygun sonuçları;
+          harita, GeoTIFF, Excel ve CBS proje paketi olarak üret.</p>
+          <blockquote style="margin:1rem 0 0;padding:.75rem 1rem;border-left:3px solid #ffd67a;
+          color:#efffff;background:rgba(255,255,255,.08);border-radius:0 10px 10px 0">
+            “Her şey diğer her şeyle ilişkilidir; fakat yakın olanlar uzak olanlardan daha çok ilişkilidir.”
+            <span style="display:block;margin-top:.3rem;font-size:.82rem;color:#bfe9e6">
+              — Waldo Tobler, Coğrafyanın Birinci Yasası
+            </span>
+          </blockquote>
         </section>
         """,
         unsafe_allow_html=True,
@@ -480,25 +482,25 @@ with tab_data:
     with c2:
         ce_products = {
             "SPI": {
-                "CHIRPS Daily (4,8 km)": ("CHIRPS_DAILY", ["precipitation"]),
-                "CHIRPS Pentad (4,8 km)": ("CHIRPS_PENTAD", ["precipitation"]),
-                "CHIRPS Preliminary Pentad": ("CHIRPS_PRELIM_PENTAD", ["precipitation"]),
-                "ERA5-Ag Daily (9,6 km)": ("ERA5_AG", ["total_precipitation"]),
+                "CHIRPS Daily (4,8 km)": ("CHIRPS_DAILY", ["precipitation"], date(1981, 1, 1)),
+                "CHIRPS Pentad (4,8 km)": ("CHIRPS_PENTAD", ["precipitation"], date(1981, 1, 1)),
+                "CHIRPS Preliminary Pentad": ("CHIRPS_PRELIM_PENTAD", ["precipitation"], date(2015, 1, 1)),
+                "ERA5-Ag Daily (9,6 km)": ("ERA5_AG", ["total_precipitation"], date(1979, 1, 1)),
             },
             "NDVI": {
-                "Sentinel-2 Surface Reflectance (10 m)": ("SENTINEL2_SR", ["NDVI"]),
-                "Harmonized Landsat–Sentinel-2 (30 m)": ("HLS_SR", ["NDVI"]),
-                "Landsat 5/7/8/9 Surface Reflectance (30 m)": ("LANDSAT_SR", ["NDVI"]),
+                "Sentinel-2 Surface Reflectance (10 m)": ("SENTINEL2_SR", ["NDVI"], date(2015, 1, 1)),
+                "Harmonized Landsat–Sentinel-2 (30 m)": ("HLS_SR", ["NDVI"], date(2013, 4, 11)),
+                "Landsat 5/7/8/9 Surface Reflectance (30 m)": ("LANDSAT_SR", ["NDVI"], date(1984, 1, 1)),
             },
             "EVI": {
-                "Sentinel-2 Surface Reflectance (10 m)": ("SENTINEL2_SR", ["EVI"]),
-                "Harmonized Landsat–Sentinel-2 (30 m)": ("HLS_SR", ["EVI"]),
-                "Landsat 5/7/8/9 Surface Reflectance (30 m)": ("LANDSAT_SR", ["EVI"]),
+                "Sentinel-2 Surface Reflectance (10 m)": ("SENTINEL2_SR", ["EVI"], date(2015, 1, 1)),
+                "Harmonized Landsat–Sentinel-2 (30 m)": ("HLS_SR", ["EVI"], date(2013, 4, 11)),
+                "Landsat 5/7/8/9 Surface Reflectance (30 m)": ("LANDSAT_SR", ["EVI"], date(1984, 1, 1)),
             },
             "LST": {
-                "Landsat 8 Surface Reflectance (30 m)": ("LANDSAT8_SR", ["LST"]),
-                "Landsat 5/7/8/9 Surface Reflectance (30 m)": ("LANDSAT_SR", ["LST"]),
-                "MODIS Terra 8-day (1 km)": ("MODIS_TERRA_8DAY", ["LST_Day_1km"]),
+                "Landsat 8 Surface Reflectance (30 m)": ("LANDSAT8_SR", ["LST"], date(2013, 4, 11)),
+                "Landsat 5/7/8/9 Surface Reflectance (30 m)": ("LANDSAT_SR", ["LST"], date(1984, 1, 1)),
+                "MODIS Terra 8-day (1 km)": ("MODIS_TERRA_8DAY", ["LST_Day_1km"], date(2000, 2, 18)),
             },
         }
         gee_products = {
@@ -518,12 +520,17 @@ with tab_data:
                 for value in ce_products[analysis_for_source].values()
             }
             selected_dataset = ce_products[analysis_for_source][product][0]
+            product_start_date = ce_products[analysis_for_source][product][2]
             ce_dataset_id = st.selectbox(
                 "Dataset parametresi",
                 list(dataset_options),
                 index=list(dataset_options).index(selected_dataset),
                 help="Climate Engine API'nin kullandığı resmî dataset kodudur.",
             )
+            product_start_date = {
+                value[0]: value[2]
+                for value in ce_products[analysis_for_source].values()
+            }[ce_dataset_id]
             ce_variable_id = st.selectbox(
                 "Değişken parametresi",
                 dataset_options[ce_dataset_id],
@@ -542,6 +549,12 @@ with tab_data:
                 help=f"{analysis_for_source} için doğrulanmış Earth Engine koleksiyonu.",
             )
             ce_dataset_id, ce_variable_ids = "", ""
+            product_start_date = {
+                "SPI": date(1981, 1, 1),
+                "NDVI": date(2017, 3, 28),
+                "EVI": date(2017, 3, 28),
+                "LST": date(2013, 4, 11),
+            }[analysis_for_source]
         variables = {
             "SPI": ["Yağış"],
             "NDVI": ["NDVI / EVI"],
@@ -564,21 +577,23 @@ with tab_data:
             year_left, year_right = st.columns(2)
             start_year = year_left.number_input(
                 "Başlangıç yılı",
-                min_value=1900,
+                min_value=product_start_date.year,
                 max_value=date.today().year,
-                value=1981,
+                value=product_start_date.year,
                 step=1,
-                help="Analize dahil edilecek ilk takvim yılı.",
+                help=f"Seçili ürünün doğrulanmış veri başlangıcı: {product_start_date:%d.%m.%Y}.",
+                key=f"start_year_{provider}_{analysis_for_source}_{ce_dataset_id or product}",
             )
             end_year = year_right.number_input(
                 "Bitiş yılı",
-                min_value=1900,
+                min_value=product_start_date.year,
                 max_value=date.today().year,
                 value=date.today().year,
                 step=1,
                 help="Analize dahil edilecek son takvim yılı; mevcut yıl seçilirse bugün sona erer.",
+                key=f"end_year_{provider}_{analysis_for_source}_{ce_dataset_id or product}",
             )
-            start_date = date(int(start_year), 1, 1)
+            start_date = max(date(int(start_year), 1, 1), product_start_date)
             end_date = (
                 date.today()
                 if int(end_year) == date.today().year
@@ -587,13 +602,24 @@ with tab_data:
             st.caption(f"Uygulanacak dönem: {start_date:%d.%m.%Y} – {end_date:%d.%m.%Y}")
         else:
             start_date = st.date_input(
-                "Başlangıç tarihi", date(1981, 1, 1),
-                help="Veri sorgusunun başlayacağı günü seçin.",
+                "Başlangıç tarihi", product_start_date,
+                min_value=product_start_date,
+                max_value=date.today(),
+                help=f"Seçili ürünün doğrulanmış veri başlangıcı: {product_start_date:%d.%m.%Y}.",
+                key=f"start_date_{provider}_{analysis_for_source}_{ce_dataset_id or product}",
             )
             end_date = st.date_input(
                 "Bitiş tarihi", date.today(),
+                min_value=product_start_date,
+                max_value=date.today(),
                 help="Veri sorgusunun sona ereceği günü seçin.",
+                key=f"end_date_{provider}_{analysis_for_source}_{ce_dataset_id or product}",
             )
+        period_compatible = start_date >= product_start_date and start_date <= end_date
+        st.caption(
+            f"{product} kullanılabilir dönem başlangıcı: {product_start_date:%d.%m.%Y}. "
+            "Bu tarihten önceki bir dönem için daha eski arşive sahip başka bir ürün seçilmelidir."
+        )
         temporal_scale = "Aylık" if analysis_for_source == "SPI" else "Dönem kompoziti"
         aggregation = "Toplam" if analysis_for_source == "SPI" else "Medyan"
         start_time, end_time = None, None
@@ -603,6 +629,11 @@ with tab_data:
         )
         if start_date > end_date:
             st.error("Başlangıç yılı/tarihi bitiş değerinden sonra olamaz.")
+        if start_date < product_start_date:
+            st.error(
+                f"{product}, {product_start_date:%d.%m.%Y} öncesinde veri içermez. "
+                "İstek gönderilmedi; ürün veya başlangıç tarihini değiştirin."
+            )
 
     st.success(
         f"Uyumlu seçim: {analysis_for_source} · {provider} · {product}. "
@@ -749,7 +780,7 @@ with tab_output:
         else bool(gee_ok and gee_project)
     )
     can_build = bool(
-        summary and variables and selected_analyses and start_date <= end_date and source_ready
+        summary and variables and selected_analyses and period_compatible and source_ready
     )
     if not summary:
         st.warning("Önce Alan sekmesinden geçerli bir çalışma alanı yükleyin.")
@@ -787,6 +818,7 @@ with tab_output:
         else:
             try:
                 with st.spinner("Seçilen kaynaktan gerçek veri indiriliyor ve çıktılar hazırlanıyor..."):
+                    source_request_metadata = {}
                     if provider == "Google Earth Engine":
                         climate_latitude, climate_longitude = summary.centroid
                         climate_elevation = None
@@ -832,6 +864,7 @@ with tab_output:
                             f"Climate Engine API · {ce_dataset_id} · {ce_variable_ids}"
                         )
                         climate_url = ce_metadata["endpoint"]
+                        source_request_metadata = ce_metadata
                         climate_latitude, climate_longitude = summary.centroid
                         climate_elevation = None
                         unsupported = []
@@ -926,6 +959,7 @@ with tab_output:
                             "temporal_scale": temporal_scale,
                             "aggregation": aggregation,
                             "quality_control": quality_control,
+                            "source_request_metadata": source_request_metadata,
                         },
                         analysis={"methods": selected_analyses, "parameters": analysis_params},
                         outputs={"formats": output_formats, "contents": include_items},
@@ -1348,7 +1382,7 @@ st.markdown(
       text-align:center;color:#496b73;background:rgba(255,255,255,.45);border-radius:18px 18px 0 0">
       <strong style="color:#075b68;letter-spacing:.08em">ZETRİKLİM</strong><br>
       Havza, iklim ve uzaktan algılama analiz platformu<br>
-      <span style="font-size:.82rem">Geliştiren: Zeliha Konuk · Tez araştırması prototipi · 2026</span>
+      <span style="font-size:.82rem">Zeliha Konuk · 2026</span>
     </div>
     """,
     unsafe_allow_html=True,
