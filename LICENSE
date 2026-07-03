@@ -1,23 +1,21 @@
-# Zetriklim'i internette yayımlama
+MIT License
 
-## 1. GitHub
+Copyright (c) 2026 Zetriklim Contributors
 
-Bu klasörü herkese açık bir GitHub deposuna yükleyin. `.venv`, `client_secret`,
-`secrets.toml` ve hizmet hesabı anahtarı depoya eklenmemelidir.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-## 2. Earth Engine bulut hesabı
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-Google Cloud projesinde bir hizmet hesabı oluşturun, Earth Engine erişimini ve
-gerekli proje izinlerini tanımlayın. Hizmet hesabı e-postası ile özel anahtarı
-yalnızca Streamlit Secrets ekranında saklayın.
-
-## 3. Streamlit Community Cloud
-
-1. https://share.streamlit.io adresinde GitHub hesabınızla giriş yapın.
-2. `Create app` seçeneğinden GitHub deposunu ve `app.py` dosyasını seçin.
-3. App settings > Secrets alanına `.streamlit/secrets.toml.example` içindeki
-   şablonu kendi değerlerinizle girin.
-4. Deploy düğmesine basın.
-
-Dağıtım tamamlandığında uygulama `https://...streamlit.app` biçiminde kalıcı
-bir adres alır.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

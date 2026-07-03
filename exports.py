@@ -1,341 +1,183 @@
-"""Climate Engine API bağlantısı ve kullanıcı anahtarı doğrulaması."""
+"""Excel, CSV, grafik ve CBS çıktıları."""
 
 from __future__ import annotations
 
-import os
-import json
-from datetime import timedelta
-from typing import Any
+import io
+import tempfile
+import zipfile
+from pathlib import Path
 
 import geopandas as gpd
 import pandas as pd
-import requests
+import rasterio
+from rasterio.io import MemoryFile
+from rasterio.plot import plotting_extent
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
+from openpyxl.chart import LineChart, Reference
+from openpyxl.styles import Alignment, Font, PatternFill
 
 
-BASE_URL = "https://api.climateengine.org"
-
-DATASET_START_DATES = {
-    "CHIRPS_DAILY": "1981-01-01",
-    "CHIRPS_PENTAD": "1981-01-01",
-    "CHIRPS_PRELIM_PENTAD": "2015-01-01",
-    "ERA5_AG": "1979-01-01",
-    "SENTINEL2_SR": "2015-01-01",
-    "HLS_SR": "2013-04-11",
-    "LANDSAT_SR": "1984-01-01",
-    "LANDSAT8_SR": "2013-04-11",
-    "MODIS_TERRA_8DAY": "2000-02-18",
-}
+NAVY = "063447"
+TEAL = "00A6A6"
+PALE = "E2F4F2"
+AMBER = "FFAD33"
 
 
-def api_key_available(api_key: str | None = None) -> bool:
-    return bool(api_key or os.getenv("CLIMATE_ENGINE_API_KEY"))
+def dataframe_to_csv(data: pd.DataFrame) -> bytes:
+    return data.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 
 
-def connection_label(api_key: str | None = None) -> str:
-    return "Bağlı" if api_key_available(api_key) else "API anahtarı bekleniyor"
+def build_excel(
+    data: pd.DataFrame,
+    *,
+    metadata_rows: list[tuple[str, object]],
+    area_rows: list[tuple[str, object]],
+    analysis_tables: dict[str, pd.DataFrame] | None = None,
+) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        data.to_excel(writer, sheet_name="İklim Verisi", index=False)
+        pd.DataFrame(metadata_rows, columns=["Alan", "Değer"]).to_excel(writer, sheet_name="Kaynak ve Yöntem", index=False)
+        pd.DataFrame(area_rows, columns=["Alan Özelliği", "Değer"]).to_excel(writer, sheet_name="Çalışma Alanı", index=False)
+        data.describe(include="all").transpose().reset_index().to_excel(writer, sheet_name="Veri Özeti", index=False)
+        for name, table in (analysis_tables or {}).items():
+            table.to_excel(writer, sheet_name=name[:31], index=False)
 
+        for sheet in writer.book.worksheets:
+            sheet.freeze_panes = "A2"
+            sheet.auto_filter.ref = sheet.dimensions
+            for cell in sheet[1]:
+                cell.fill = PatternFill("solid", fgColor=NAVY)
+                cell.font = Font(color="FFFFFF", bold=True)
+                cell.alignment = Alignment(horizontal="center")
+            for column in sheet.columns:
+                letter = column[0].column_letter
+                width = min(max(len(str(cell.value or "")) for cell in column) + 2, 42)
+                sheet.column_dimensions[letter].width = max(width, 12)
 
-def validate_api_key(api_key: str) -> dict[str, Any]:
-    """Anahtarı Climate Engine'in resmi doğrulama uç noktasında sınar."""
-    response = requests.get(
-        f"{BASE_URL}/home/validate_key",
-        headers={"Authorization": api_key.strip()},
-        timeout=30,
-    )
-    if response.status_code in {401, 403}:
-        raise ValueError("API anahtarı geçersiz veya bu işlem için yetkisiz.")
-    response.raise_for_status()
-    try:
-        validation = response.json()
-    except ValueError:
-        validation = {"message": response.text.strip() or "Anahtar doğrulandı."}
-
-    expiration_response = requests.get(
-        f"{BASE_URL}/home/key_expiration",
-        headers={"Authorization": api_key.strip()},
-        timeout=30,
-    )
-    expiration = None
-    if expiration_response.ok:
-        try:
-            expiration = expiration_response.json()
-        except ValueError:
-            expiration = expiration_response.text.strip()
-    return {"validation": validation, "expiration": expiration}
-
-
-def fetch_timeseries(
-    api_key: str,
-    gdf: gpd.GeoDataFrame,
-    start_date,
-    end_date,
-    dataset: str,
-    variables: str,
-    area_reducer: str = "mean",
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Yüklenen alan için Climate Engine native zaman serisini getirir."""
-    if gdf.empty or gdf.crs is None:
-        raise ValueError("Çalışma alanı boş veya koordinat sistemi tanımsız.")
-    wgs84 = gdf.to_crs(4326).copy()
-    wgs84["geometry"] = wgs84.geometry.make_valid()
-    wgs84 = wgs84[
-        ~wgs84.geometry.is_empty
-        & wgs84.geometry.geom_type.isin(["Polygon", "MultiPolygon"])
-    ]
-    if wgs84.empty:
-        raise ValueError("Çalışma alanında geçerli Polygon veya MultiPolygon geometrisi bulunamadı.")
-
-    requested_start = pd.Timestamp(start_date).date()
-    requested_end = pd.Timestamp(end_date).date()
-    dataset_start = DATASET_START_DATES.get(dataset.strip())
-    if dataset_start and requested_start < pd.Timestamp(dataset_start).date():
-        raise ValueError(
-            f"{dataset} veri ürünü {dataset_start} tarihinde başlar; "
-            f"{requested_start}/{requested_end} dönemi bu ürünle sorgulanamaz."
-        )
-
-    metric_crs = wgs84.estimate_utm_crs() or "EPSG:6933"
-    metric_geometry = wgs84[["geometry"]].dissolve().to_crs(metric_crs)
-    tolerance = 0
-    candidate = metric_geometry.to_crs(4326).geometry.iloc[0]
-    coordinates = json.dumps(candidate.__geo_interface__["coordinates"])
-    while len(coordinates) > 80_000 and tolerance < 10_000:
-        tolerance = 100 if tolerance == 0 else tolerance * 2
-        candidate = (
-            metric_geometry.simplify(tolerance, preserve_topology=True)
-            .to_crs(4326)
-            .iloc[0]
-        )
-        coordinates = json.dumps(candidate.__geo_interface__["coordinates"])
-    endpoint = f"{BASE_URL}/timeseries/native/coordinates"
-    headers = {"Authorization": api_key.strip()}
-
-    def request_period(period_start, period_end) -> tuple[list[dict], dict[str, Any]]:
-        payload = {
-            "coordinates": coordinates,
-            "area_reducer": area_reducer,
-            "dataset": dataset.strip(),
-            "variable": variables.strip(),
-            "start_date": str(period_start),
-            "end_date": str(period_end),
-        }
-        response = requests.post(endpoint, headers=headers, json=payload, timeout=300)
-        if response.status_code in {401, 403}:
-            raise ValueError(
-                "Climate Engine anahtarı geçersiz, süresi dolmuş veya kotası yetersiz."
+        data_sheet = writer.book["İklim Verisi"]
+        data_sheet.sheet_view.showGridLines = False
+        for row in range(2, data_sheet.max_row + 1):
+            if row % 2 == 0:
+                for cell in data_sheet[row]:
+                    cell.fill = PatternFill("solid", fgColor="F2FAF9")
+        if data_sheet.max_column >= 2 and data_sheet.max_row >= 3:
+            chart = LineChart()
+            chart.title = "İklim Zaman Serisi"
+            chart.style = 13
+            chart.y_axis.title = "Değer"
+            chart.x_axis.title = "Tarih"
+            chart.add_data(
+                Reference(data_sheet, min_col=5, max_col=min(data_sheet.max_column, 8), min_row=1, max_row=data_sheet.max_row),
+                titles_from_data=True,
             )
-        if not response.ok:
-            try:
-                error_detail = response.json()
-            except ValueError:
-                error_detail = response.text.strip()
-            error_text = str(error_detail)
-            span_days = (period_end - period_start).days
-            if "No data returned" in error_text:
-                available_from = DATASET_START_DATES.get(dataset.strip(), "ürünün katalog başlangıcı")
-                raise ValueError(
-                    f"{dataset} için {period_start}/{period_end} döneminde veri bulunamadı. "
-                    f"Bilinen başlangıç: {available_from}. Tarih aralığını, bulutluluk durumunu "
-                    "ve çalışma alanının ürün kapsamı içinde olduğunu kontrol edin."
-                )
-            if (
-                response.status_code >= 500
-                and "Response size exceeds limit" in error_text
-                and span_days > 31
-            ):
-                midpoint = period_start + timedelta(days=span_days // 2)
-                left_records, left_meta = request_period(period_start, midpoint)
-                right_records, right_meta = request_period(
-                    midpoint + timedelta(days=1), period_end
-                )
-                return left_records + right_records, {
-                    "split": True,
-                    "parts": [left_meta, right_meta],
-                }
-            raise RuntimeError(
-                f"Climate Engine isteği başarısız (HTTP {response.status_code}). "
-                f"Dataset={dataset}, değişken={variables}, dönem={period_start}/{period_end}, "
-                f"geometri={len(coordinates):,} karakter, sadeleştirme={tolerance} m. "
-                f"Servis yanıtı: {error_text[:1200]}"
-            )
-        body = response.json()
-        series_groups = body.get("Data")
-        if not series_groups:
-            return [], {
-                key: value for key, value in body.items() if key != "Data"
-            }
-        first_group = series_groups[0] if isinstance(series_groups, list) else series_groups
-        records = first_group.get("Data") if isinstance(first_group, dict) else first_group
-        if isinstance(records, dict):
-            normalized_records = pd.DataFrame.from_dict(records).to_dict("records")
-        else:
-            normalized_records = list(records or [])
-        return normalized_records, {
-            key: value for key, value in body.items() if key != "Data"
-        }
+            chart.set_categories(Reference(data_sheet, min_col=1, min_row=2, max_row=data_sheet.max_row))
+            chart.height = 9
+            chart.width = 18
+            summary_sheet = writer.book["Veri Özeti"]
+            summary_sheet.add_chart(chart, "H2")
+    return output.getvalue()
 
-    all_records: list[dict] = []
-    chunk_metadata = []
-    chunk_start = requested_start
-    while chunk_start <= requested_end:
-        chunk_end = min(
-            (pd.Timestamp(chunk_start) + pd.DateOffset(years=5) - pd.Timedelta(days=1)).date(),
-            requested_end,
+
+def build_raster_png(
+    geotiff: bytes,
+    title: str,
+    *,
+    boundary: gpd.GeoDataFrame | None = None,
+    palette: str = "RdBu",
+    colorbar_label: str = "SPI",
+    fixed_range: tuple[float, float] | None = (-2.5, 2.5),
+) -> bytes:
+    with MemoryFile(geotiff) as memory:
+        with memory.open() as src:
+            raster = src.read(1, masked=True).astype(float).filled(float("nan"))
+            extent = plotting_extent(src)
+            raster_crs = src.crs
+    fig = Figure(figsize=(9, 7), dpi=150, facecolor="#f7f5ee")
+    ax = fig.add_subplot(111)
+    range_args = (
+        {"vmin": fixed_range[0], "vmax": fixed_range[1]}
+        if fixed_range is not None
+        else {}
+    )
+    image = ax.imshow(raster, cmap=palette, extent=extent, origin="upper", **range_args)
+    if boundary is not None and raster_crs is not None:
+        boundary.to_crs(raster_crs).boundary.plot(
+            ax=ax,
+            color="#082f49",
+            linewidth=1.4,
+            zorder=3,
         )
-        records, response_metadata = request_period(chunk_start, chunk_end)
-        all_records.extend(records)
-        chunk_metadata.append(
+    ax.set_title(title, color="#063447", fontsize=13, weight="bold")
+    ax.set_axis_off()
+    colorbar = fig.colorbar(image, ax=ax, shrink=0.78)
+    colorbar.set_label(colorbar_label)
+    fig.tight_layout()
+    output = io.BytesIO()
+    FigureCanvasAgg(fig).print_png(output)
+    return output.getvalue()
+
+
+def build_timeseries_png(data: pd.DataFrame) -> bytes:
+    numeric = data.drop(columns=["Örnek ID", "Enlem", "Boylam"], errors="ignore").select_dtypes("number")
+    fig = Figure(figsize=(12, 6), dpi=150, facecolor="#f7f5ee")
+    ax = fig.add_subplot(111)
+    for column in numeric.columns[:5]:
+        ax.plot(data["Tarih"], numeric[column], linewidth=1.1, label=column)
+    ax.set_title("Zetriklim – Analiz Zaman Serisi", color="#063447", fontsize=14, weight="bold")
+    ax.set_xlabel("Tarih")
+    ax.grid(alpha=0.20)
+    ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    output = io.BytesIO()
+    FigureCanvasAgg(fig).print_png(output)
+    return output.getvalue()
+
+
+def build_area_map_png(gdf: gpd.GeoDataFrame, point: tuple[float, float]) -> bytes:
+    fig = Figure(figsize=(9, 7), dpi=150, facecolor="#f7f5ee")
+    ax = fig.add_subplot(111)
+    projected = gdf.to_crs(3857)
+    projected.plot(ax=ax, facecolor="#62d5cc", edgecolor="#063447", linewidth=1.6)
+    area_km2 = projected.geometry.union_all().area / 1_000_000
+    ax.set_title("Çalışma Alanı / Havza Sınırı", color="#063447", fontsize=13, weight="bold")
+    ax.text(
+        0.02,
+        0.02,
+        f"Alan: {area_km2:,.2f} km²",
+        transform=ax.transAxes,
+        fontsize=9,
+        color="#063447",
+        bbox={"facecolor": "white", "edgecolor": "#00a6a6", "alpha": 0.9, "boxstyle": "round,pad=0.4"},
+    )
+    ax.set_axis_off()
+    fig.tight_layout()
+    output = io.BytesIO()
+    FigureCanvasAgg(fig).print_png(output)
+    return output.getvalue()
+
+
+def geodata_to_gpkg(gdf: gpd.GeoDataFrame, point: tuple[float, float]) -> bytes:
+    with tempfile.TemporaryDirectory(prefix="zetriklim_gpkg_") as temp:
+        path = Path(temp) / "zetriklim-cbs.gpkg"
+        gdf.to_file(path, layer="calisma_alani", driver="GPKG")
+        point_gdf = gpd.GeoDataFrame(
             {
-                "start": str(chunk_start),
-                "end": str(chunk_end),
-                "record_count": len(records),
-                "metadata": response_metadata,
-            }
+                "ornek_id": [1],
+                "aciklama": ["İklim verisi örnekleme noktası"],
+                "csv_baglanti_alani": ["Örnek ID"],
+            },
+            geometry=gpd.points_from_xy([point[1]], [point[0]]),
+            crs=4326,
         )
-        chunk_start = chunk_end + timedelta(days=1)
-
-    data = pd.DataFrame.from_dict(all_records)
-    if data.empty:
-        raise ValueError("Climate Engine yanıtındaki zaman serisi boş.")
-    date_column = next(
-        (column for column in data.columns if column.lower() in {"date", "tarih", "time"}),
-        None,
-    )
-    if date_column:
-        data = data.rename(columns={date_column: "Tarih"})
-        data["Tarih"] = pd.to_datetime(data["Tarih"], errors="coerce")
-    else:
-        raise ValueError("Climate Engine yanıtında tarih alanı bulunamadı.")
-
-    identifier_columns = {
-        "Tarih", "Date", "date", "time", "Time", "system:index",
-        "latitude", "longitude", "lat", "lon", "name", "id",
-    }
-    for column in data.columns:
-        if column not in identifier_columns:
-            converted = pd.to_numeric(data[column], errors="coerce")
-            if converted.notna().any():
-                data[column] = converted
-
-    centroid = wgs84.dissolve().geometry.iloc[0].centroid
-    data.insert(1, "Örnek ID", 1)
-    data.insert(2, "Enlem", float(centroid.y))
-    data.insert(3, "Boylam", float(centroid.x))
-    requested_variables = {
-        item.strip().lower() for item in variables.split(",") if item.strip()
-    }
-    rain_candidates = [
-        column
-        for column in data.columns
-        if (
-            "precip" in str(column).lower()
-            or str(column).lower() in {"pr", "ppt", "rain", "rainfall"}
-        )
-        and pd.api.types.is_numeric_dtype(data[column])
-    ]
-    if requested_variables & {"precipitation", "pr", "ppt", "rain", "rainfall"}:
-        if not rain_candidates:
-            value_candidates = [
-                column
-                for column in data.select_dtypes(include="number").columns
-                if column not in {"Örnek ID", "Enlem", "Boylam"}
-            ]
-            if len(value_candidates) == 1:
-                rain_candidates = value_candidates
-        if rain_candidates:
-            data = data.rename(columns={rain_candidates[0]: "Toplam yağış (mm)"})
-    metadata = {
-        "endpoint": endpoint,
-        "dataset": dataset,
-        "variables": variables,
-        "area_reducer": area_reducer,
-        "geometry_type": candidate.geom_type,
-        "geometry_valid": bool(candidate.is_valid),
-        "geometry_bounds_wgs84": [float(value) for value in candidate.bounds],
-        "geometry_coordinate_characters": len(coordinates),
-        "geometry_simplification_m": tolerance,
-        "request_chunks": chunk_metadata,
-    }
-    return data, metadata
+        point_gdf.to_file(path, layer="ornekleme_noktasi", driver="GPKG")
+        return path.read_bytes()
 
 
-def fetch_map_tile(
-    api_key: str,
-    gdf: gpd.GeoDataFrame,
-    start_date,
-    end_date,
-    dataset: str,
-    variable: str,
-    analysis: str,
-) -> tuple[str, dict[str, Any]]:
-    """Climate Engine MapID uç noktasından görselleştirme karo adresi alır."""
-    bounds = gdf.to_crs(4326).total_bounds.tolist()
-    if analysis == "SPI":
-        endpoint = f"{BASE_URL}/raster/mapid/standard_index"
-        params = {
-            "dataset": dataset,
-            "variable": "spi",
-            "distribution": "gamma",
-            "start_date": str(start_date),
-            "end_date": str(end_date),
-            "start_year": int(pd.Timestamp(start_date).year),
-            "end_year": int(pd.Timestamp(end_date).year),
-            "bounding_box": str(bounds),
-            "colormap_opacity": 0.85,
-            "colormap_type": "continuous",
-        }
-    else:
-        endpoint = f"{BASE_URL}/raster/mapid/values"
-        params = {
-            "dataset": dataset,
-            "variable": variable,
-            "temporal_statistic": "mean",
-            "start_date": str(start_date),
-            "end_date": str(end_date),
-            "bounding_box": str(bounds),
-            "colormap_opacity": 0.85,
-            "colormap_type": "continuous",
-        }
-    response = requests.get(
-        endpoint,
-        headers={"Authorization": api_key.strip()},
-        params=params,
-        timeout=180,
-    )
-    if not response.ok:
-        try:
-            detail = response.json()
-        except ValueError:
-            detail = response.text.strip()
-        raise RuntimeError(
-            f"Climate Engine haritası üretilemedi (HTTP {response.status_code}): "
-            f"{str(detail)[:1000]}"
-        )
-    body = response.json()
-
-    def find_tile_url(value):
-        if isinstance(value, dict):
-            for key, child in value.items():
-                if key == "tile_fetcher" and isinstance(child, str):
-                    return child
-                found = find_tile_url(child)
-                if found:
-                    return found
-        elif isinstance(value, list):
-            for child in value:
-                found = find_tile_url(child)
-                if found:
-                    return found
-        return None
-
-    tile_url = find_tile_url(body)
-    if not tile_url:
-        raise ValueError("Climate Engine yanıtında tile_fetcher harita adresi bulunamadı.")
-    return tile_url, {
-        "endpoint": endpoint,
-        "dataset": dataset,
-        "variable": variable,
-        "analysis": analysis,
-        "period": f"{start_date}/{end_date}",
-        "bounds": bounds,
-    }
+def build_complete_package(files: dict[str, bytes]) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, content in files.items():
+            archive.writestr(name, content)
+    return output.getvalue()
