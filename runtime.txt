@@ -1,1 +1,12 @@
-python-3.11
+streamlit==1.58.0
+geopandas==1.1.4
+folium==0.20.0
+streamlit-folium==0.27.2
+plotly==6.8.0
+requests==2.34.2
+openpyxl==3.1.5
+matplotlib==3.10.8
+earthengine-api==1.7.33
+rasterio==1.5.0
+pyshp==3.1.4
+scipy==1.18.0

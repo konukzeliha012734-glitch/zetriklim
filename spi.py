@@ -1,795 +1,173 @@
-"""Google Earth Engine CHIRPS bağlantısı ve gerçek SPI raster üretimi."""
+"""Open-Meteo ERA5-Land bağlantısı ve zaman serisi dönüştürme."""
 
 from __future__ import annotations
 
-import io
-import os
-import tempfile
-import zipfile
-from datetime import date
-from pathlib import Path
+from dataclasses import dataclass
+from datetime import date, timedelta
 
-import ee
-import geopandas as gpd
-import numpy as np
 import pandas as pd
-import rasterio
 import requests
-from google.oauth2.credentials import Credentials
-from dateutil.relativedelta import relativedelta
-from rasterio.io import MemoryFile
-from rasterio.features import geometry_mask
-from rasterio.mask import mask as raster_mask
-
-from zetriklim.spi import calculate_spi_pixel_stack
 
 
-CHIRPS_DAILY = "UCSB-CHG/CHIRPS/DAILY"
-CHIRPS_SCALE_M = 5566
+ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
-REMOTE_ANALYSIS_SPECS = {
-    "NDVI": {
-        "source": "COPERNICUS/S2_SR_HARMONIZED",
-        "formula": "(NIR - Red) / (NIR + Red)",
-        "native_scale_m": 10,
-        "unit": "index",
-    },
-    "NDWI": {
-        "source": "COPERNICUS/S2_SR_HARMONIZED",
-        "formula": "(Green - NIR) / (Green + NIR)",
-        "native_scale_m": 10,
-        "unit": "index",
-    },
-    "NDMI": {
-        "source": "COPERNICUS/S2_SR_HARMONIZED",
-        "formula": "(NIR - SWIR1) / (NIR + SWIR1)",
-        "native_scale_m": 20,
-        "unit": "index",
-    },
-    "NDBI": {
-        "source": "COPERNICUS/S2_SR_HARMONIZED",
-        "formula": "(SWIR1 - NIR) / (SWIR1 + NIR)",
-        "native_scale_m": 20,
-        "unit": "index",
-    },
-    "EVI": {
-        "source": "COPERNICUS/S2_SR_HARMONIZED",
-        "formula": "2.5 * (NIR - Red) / (NIR + 6*Red - 7.5*Blue + 1)",
-        "native_scale_m": 10,
-        "unit": "index",
-    },
-    "SAVI": {
-        "source": "COPERNICUS/S2_SR_HARMONIZED",
-        "formula": "1.5 * (NIR - Red) / (NIR + Red + 0.5)",
-        "native_scale_m": 10,
-        "unit": "index",
-    },
-    "LST": {
-        "source": "LANDSAT/LC08+C09/C02/T1_L2",
-        "formula": "ST_B10 * 0.00341802 + 149.0 - 273.15",
-        "native_scale_m": 30,
-        "unit": "°C",
-    },
-    "DEM": {
-        "source": "USGS/SRTMGL1_003",
-        "formula": "SRTM elevation",
-        "native_scale_m": 30,
-        "unit": "m",
-    },
-    "SLOPE": {
-        "source": "USGS/SRTMGL1_003",
-        "formula": "ee.Terrain.slope(DEM)",
-        "native_scale_m": 30,
-        "unit": "degree",
-    },
-    "ASPECT": {
-        "source": "USGS/SRTMGL1_003",
-        "formula": "ee.Terrain.aspect(DEM)",
-        "native_scale_m": 30,
-        "unit": "degree",
-    },
-    "TWI": {
-        "source": "MERIT/Hydro/v1_0_1 + USGS/SRTMGL1_003",
-        "formula": "ln((upstream_area_m2 / cell_width_m) / tan(slope_radians))",
-        "native_scale_m": 90,
-        "unit": "index",
-    },
+DAILY_VARIABLES = {
+    "Yağış": ["precipitation_sum"],
+    "Hava sıcaklığı": ["temperature_2m_mean", "temperature_2m_min", "temperature_2m_max"],
+    "Bağıl nem": ["relative_humidity_2m_mean"],
+    "Çiy noktası": ["dew_point_2m_mean"],
+    "Rüzgâr hızı ve yönü": ["wind_speed_10m_mean", "wind_speed_10m_max", "wind_direction_10m_dominant"],
+    "Buharlaşma / gerçek ET": ["et0_fao_evapotranspiration"],
+    "Potansiyel evapotranspirasyon": ["et0_fao_evapotranspiration"],
+    "Yüzey / deniz seviyesi basıncı": ["surface_pressure_mean", "pressure_msl_mean"],
+    "Toprak nemi": ["soil_moisture_0_to_7cm_mean", "soil_moisture_7_to_28cm_mean"],
+    "Kar örtüsü / kar su eşdeğeri": ["snowfall_sum", "snowfall_water_equivalent_sum"],
+    "Güneş radyasyonu": ["shortwave_radiation_sum"],
+    "Bulutluluk": ["cloud_cover_mean"],
+}
+
+HOURLY_VARIABLES = {
+    "Yağış": ["precipitation"],
+    "Hava sıcaklığı": ["temperature_2m"],
+    "Bağıl nem": ["relative_humidity_2m"],
+    "Çiy noktası": ["dew_point_2m"],
+    "Rüzgâr hızı ve yönü": ["wind_speed_10m", "wind_direction_10m"],
+    "Buharlaşma / gerçek ET": ["et0_fao_evapotranspiration"],
+    "Potansiyel evapotranspirasyon": ["et0_fao_evapotranspiration"],
+    "Yüzey / deniz seviyesi basıncı": ["surface_pressure", "pressure_msl"],
+    "Toprak nemi": ["soil_moisture_0_to_7cm", "soil_moisture_7_to_28cm"],
+    "Kar örtüsü / kar su eşdeğeri": ["snowfall", "snow_depth"],
+    "Güneş radyasyonu": ["shortwave_radiation"],
+    "Bulutluluk": ["cloud_cover"],
+}
+
+TURKISH_LABELS = {
+    "temperature_2m": "Sıcaklık (°C)",
+    "temperature_2m_mean": "Ortalama sıcaklık (°C)",
+    "temperature_2m_min": "Minimum sıcaklık (°C)",
+    "temperature_2m_max": "Maksimum sıcaklık (°C)",
+    "precipitation": "Yağış (mm)",
+    "precipitation_sum": "Toplam yağış (mm)",
+    "relative_humidity_2m": "Bağıl nem (%)",
+    "relative_humidity_2m_mean": "Ortalama bağıl nem (%)",
+    "dew_point_2m": "Çiy noktası (°C)",
+    "dew_point_2m_mean": "Ortalama çiy noktası (°C)",
+    "wind_speed_10m": "Rüzgâr hızı (km/sa)",
+    "wind_speed_10m_mean": "Ortalama rüzgâr hızı (km/sa)",
+    "wind_speed_10m_max": "Maksimum rüzgâr hızı (km/sa)",
+    "wind_direction_10m": "Rüzgâr yönü (°)",
+    "wind_direction_10m_dominant": "Baskın rüzgâr yönü (°)",
+    "et0_fao_evapotranspiration": "Referans ET₀ (mm)",
+    "surface_pressure": "Yüzey basıncı (hPa)",
+    "surface_pressure_mean": "Ortalama yüzey basıncı (hPa)",
+    "pressure_msl": "Deniz seviyesi basıncı (hPa)",
+    "pressure_msl_mean": "Ortalama deniz seviyesi basıncı (hPa)",
+    "soil_moisture_0_to_7cm": "Toprak nemi 0–7 cm (m³/m³)",
+    "soil_moisture_0_to_7cm_mean": "Ortalama toprak nemi 0–7 cm (m³/m³)",
+    "soil_moisture_7_to_28cm": "Toprak nemi 7–28 cm (m³/m³)",
+    "soil_moisture_7_to_28cm_mean": "Ortalama toprak nemi 7–28 cm (m³/m³)",
+    "snowfall": "Kar yağışı (cm)",
+    "snowfall_sum": "Toplam kar yağışı (cm)",
+    "snow_depth": "Kar kalınlığı (m)",
+    "snowfall_water_equivalent_sum": "Kar su eşdeğeri (mm)",
+    "shortwave_radiation": "Kısa dalga radyasyon (W/m²)",
+    "shortwave_radiation_sum": "Kısa dalga radyasyon (MJ/m²)",
+    "cloud_cover": "Bulutluluk (%)",
+    "cloud_cover_mean": "Ortalama bulutluluk (%)",
 }
 
 
-def project_id(explicit_project: str | None = None) -> str | None:
-    return explicit_project or os.getenv("GOOGLE_EARTH_ENGINE_PROJECT")
+@dataclass
+class ClimateResult:
+    data: pd.DataFrame
+    source_url: str
+    latitude: float
+    longitude: float
+    elevation_m: float | None
+    unsupported_variables: list[str]
+    model: str
 
 
-def create_user_auth_flow() -> tuple[str, str]:
-    """Earth Engine'in resmi uzak/notebook OAuth akışını başlatır."""
-    flow = ee.oauth.Flow("notebook")
-    return flow.auth_url, flow.code_verifier
-
-
-def exchange_user_auth_code(
-    auth_code: str,
-    code_verifier: str,
-    project: str,
-) -> dict[str, object]:
-    """Tek kullanımlık kodu oturuma özel Earth Engine kimliğine dönüştürür."""
-    request_id, pkce_verifier, client_verifier = code_verifier.split(":")
-    response = requests.post(
-        ee.oauth.FETCH_URL,
-        json={"request_id": request_id, "client_verifier": client_verifier},
-        timeout=60,
-    )
-    response.raise_for_status()
-    client_info = response.json()
-    if "error" in client_info:
-        raise RuntimeError(f"Google yetkilendirme hatası: {client_info['error']}")
-    refresh_token = ee.oauth.request_token(
-        auth_code.strip(),
-        pkce_verifier,
-        client_id=client_info["client_id"],
-        client_secret=client_info["client_secret"],
-    )
-    auth_data = {
-        "project": project,
-        "refresh_token": refresh_token,
-        "client_id": client_info["client_id"],
-        "client_secret": client_info["client_secret"],
-        "scopes": client_info.get("scopes") or ee.oauth.SCOPES,
+def _resample(data: pd.DataFrame, temporal_scale: str) -> pd.DataFrame:
+    if temporal_scale in {"Saatlik", "Günlük"}:
+        return data
+    rules = {
+        "3 saatlik": "3h",
+        "6 saatlik": "6h",
+        "Haftalık": "W",
+        "Aylık": "MS",
+        "Mevsimlik": "QS-DEC",
+        "Yıllık": "YS",
     }
-    credentials = Credentials(
-        token=None,
-        refresh_token=refresh_token,
-        token_uri=ee.oauth.TOKEN_URI,
-        client_id=str(auth_data["client_id"]),
-        client_secret=str(auth_data["client_secret"]),
-        scopes=list(auth_data["scopes"]),
-    )
-    ee.Initialize(credentials=credentials, project=project)
-    ee.Number(1).getInfo()
-    return auth_data
+    rule = rules.get(temporal_scale)
+    if not rule:
+        return data
+    numeric = data.set_index("Tarih")
+    aggregations = {}
+    for column in numeric.columns:
+        lower = column.lower()
+        aggregations[column] = "sum" if any(word in lower for word in ["yağış", "et₀", "radyasyon", "kar yağışı"]) else "mean"
+    return numeric.resample(rule).agg(aggregations).reset_index()
 
 
-def initialize_gee(project: str | None = None) -> tuple[bool, str]:
-    selected_project = project_id(project)
-    if not selected_project:
-        return False, "Google Earth Engine Project ID girilmedi."
-    try:
-        user_auth = None
-        try:
-            import streamlit as st
-
-            candidate = st.session_state.get("gee_user_auth")
-            if candidate and candidate.get("project") == selected_project:
-                user_auth = candidate
-        except Exception:
-            pass
-        if user_auth:
-            credentials = Credentials(
-                token=None,
-                refresh_token=user_auth["refresh_token"],
-                token_uri=ee.oauth.TOKEN_URI,
-                client_id=user_auth["client_id"],
-                client_secret=user_auth["client_secret"],
-                scopes=user_auth["scopes"],
-            )
-            ee.Initialize(credentials=credentials, project=selected_project)
-            return True, f"Bağlı · {selected_project} · kişisel Google oturumu"
-        service_account = os.getenv("GEE_SERVICE_ACCOUNT", "").strip()
-        private_key = os.getenv("GEE_PRIVATE_KEY", "").replace("\\n", "\n").strip()
-        if not service_account or not private_key:
-            try:
-                import streamlit as st
-
-                gee_secrets = st.secrets.get("gee", {})
-                service_account = str(
-                    gee_secrets.get("service_account", service_account)
-                ).strip()
-                private_key = str(
-                    gee_secrets.get("private_key", private_key)
-                ).replace("\\n", "\n").strip()
-            except Exception:
-                pass
-        if service_account and private_key:
-            credentials = ee.ServiceAccountCredentials(
-                service_account,
-                key_data=private_key,
-            )
-            ee.Initialize(credentials=credentials, project=selected_project)
-            return True, f"Bağlı · {selected_project} · bulut hizmet hesabı"
-        ee.Initialize(project=selected_project)
-        return True, f"Bağlı · {selected_project}"
-    except Exception as exc:
-        return False, str(exc)
-
-
-def authenticate_localhost(project: str) -> None:
-    ee.Authenticate(auth_mode="localhost", force=True)
-    ee.Initialize(project=project)
-
-
-def _ee_geometry(gdf: gpd.GeoDataFrame) -> ee.Geometry:
-    if gdf.empty or gdf.crs is None:
-        raise ValueError("Çalışma alanı boş veya koordinat sistemi tanımsız.")
-    wgs84 = gdf.to_crs(4326).copy()
-    wgs84["geometry"] = wgs84.geometry.make_valid()
-    wgs84 = wgs84[
-        ~wgs84.geometry.is_empty
-        & wgs84.geometry.geom_type.isin(["Polygon", "MultiPolygon"])
-    ]
-    if wgs84.empty:
-        raise ValueError("Earth Engine'e gönderilecek geçerli Polygon veya MultiPolygon bulunamadı.")
-    dissolved = wgs84[["geometry"]].dissolve().geometry.iloc[0]
-    return ee.Geometry(dissolved.__geo_interface__)
-
-
-def _centroid_latlon(gdf: gpd.GeoDataFrame) -> tuple[float, float]:
-    wgs84 = gdf.to_crs(4326)
-    metric_crs = wgs84.estimate_utm_crs() or "EPSG:6933"
-    centroid_metric = wgs84[["geometry"]].dissolve().to_crs(metric_crs).geometry.iloc[0].centroid
-    centroid = gpd.GeoSeries([centroid_metric], crs=metric_crs).to_crs(4326).iloc[0]
-    return float(centroid.y), float(centroid.x)
-
-
-def _adaptive_scale(gdf: gpd.GeoDataFrame, native_scale: int, max_pixels: int = 4_000_000) -> int:
-    wgs84 = gdf.to_crs(4326)
-    metric_crs = wgs84.estimate_utm_crs() or "EPSG:6933"
-    area_m2 = float(wgs84.to_crs(metric_crs).geometry.union_all().area)
-    required = int(np.ceil(np.sqrt(max(area_m2, 1) / max_pixels)))
-    scale = max(native_scale, required)
-    return int(np.ceil(scale / 10) * 10) if scale > 10 else 10
-
-
-def _mask_sentinel2(image: ee.Image) -> ee.Image:
-    scl = image.select("SCL")
-    clear = (
-        scl.neq(1)
-        .And(scl.neq(3))
-        .And(scl.neq(8))
-        .And(scl.neq(9))
-        .And(scl.neq(10))
-        .And(scl.neq(11))
-    )
-    return (
-        image.updateMask(clear)
-        .select(["B2", "B3", "B4", "B8", "B11"])
-        .divide(10000)
-        .copyProperties(image, ["system:time_start"])
-    )
-
-
-def _mask_landsat_l2(image: ee.Image) -> ee.Image:
-    qa = image.select("QA_PIXEL")
-    clear = (
-        qa.bitwiseAnd(1 << 0).eq(0)
-        .And(qa.bitwiseAnd(1 << 3).eq(0))
-        .And(qa.bitwiseAnd(1 << 4).eq(0))
-        .And(qa.bitwiseAnd(1 << 5).eq(0))
-        .And(image.select("QA_RADSAT").eq(0))
-    )
-    return image.updateMask(clear).copyProperties(image, ["system:time_start"])
-
-
-def _download_analysis_image(
-    image: ee.Image,
-    gdf: gpd.GeoDataFrame,
-    scale: int,
-    description: str,
-    tags: dict[str, str],
-) -> bytes:
-    geometry = _ee_geometry(gdf)
-    url = image.clip(geometry).getDownloadURL(
-        {
-            "region": geometry,
-            "scale": scale,
-            "format": "GEO_TIFF",
-            "filePerBand": False,
-            "crs": "EPSG:4326",
-        }
-    )
-    response = requests.get(url, timeout=300)
-    response.raise_for_status()
-    content = response.content
-    if content[:2] == b"PK":
-        with zipfile.ZipFile(io.BytesIO(content)) as archive:
-            tif_name = next(name for name in archive.namelist() if name.lower().endswith(".tif"))
-            content = archive.read(tif_name)
-
-    with MemoryFile(content) as memory:
-        with memory.open() as src:
-            raster_geometry = [
-                geometry.__geo_interface__
-                for geometry in gdf.to_crs(src.crs).geometry
-            ]
-            nodata = -9999.0
-            data, transform = raster_mask(
-                src, raster_geometry, crop=True, filled=True, nodata=nodata
-            )
-            profile = src.profile.copy()
-            profile.update(
-                count=1,
-                height=data.shape[1],
-                width=data.shape[2],
-                transform=transform,
-                dtype="float32",
-                nodata=nodata,
-                compress="deflate",
-            )
-            with MemoryFile() as output:
-                with output.open(**profile) as dst:
-                    dst.write(data.astype("float32"))
-                    dst.set_band_description(1, description)
-                    dst.update_tags(**tags)
-                return output.read()
-
-
-def build_remote_analysis_geotiff(
-    gdf: gpd.GeoDataFrame,
-    start_date: date,
-    end_date: date,
-    analysis: str,
-    project: str | None = None,
-    cloud_limit: int = 30,
-) -> tuple[bytes, dict[str, object]]:
-    """Seçilen akademik CBS analizini gerçek GEE ürünlerinden üretir."""
-    analysis = analysis.upper()
-    if analysis not in REMOTE_ANALYSIS_SPECS:
-        raise ValueError(f"Desteklenmeyen analiz: {analysis}")
-    ok, message = initialize_gee(project)
-    if not ok:
-        raise RuntimeError("Earth Engine doğrulanmadı: " + message)
-
-    spec = REMOTE_ANALYSIS_SPECS[analysis]
-    minimum_date = {
-        "NDVI": date(2017, 3, 28),
-        "EVI": date(2017, 3, 28),
-        "LST": date(2013, 4, 11),
-    }.get(analysis)
-    if minimum_date and start_date < minimum_date:
-        raise ValueError(
-            f"{analysis} için seçilen Earth Engine ürünü {minimum_date:%d.%m.%Y} tarihinde başlar. "
-            f"{start_date:%d.%m.%Y} başlangıcıyla analiz çalıştırılmadı."
-        )
-    geometry = _ee_geometry(gdf)
-    start = start_date.isoformat()
-    end = (end_date + relativedelta(days=1)).isoformat()
-    scene_count = None
-
-    if analysis in {"NDVI", "NDWI", "NDMI", "NDBI", "EVI", "SAVI"}:
-        collection = (
-            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-            .filterBounds(geometry)
-            .filterDate(start, end)
-            .filter(ee.Filter.lte("CLOUDY_PIXEL_PERCENTAGE", cloud_limit))
-            .map(_mask_sentinel2)
-        )
-        scene_count = int(collection.size().getInfo())
-        if scene_count == 0:
-            raise ValueError("Seçilen tarih ve bulut eşiğinde kullanılabilir Sentinel-2 sahnesi yok.")
-        composite = collection.median()
-        available_bands = composite.bandNames().getInfo()
-        required_bands = {"B2", "B3", "B4", "B8", "B11"}
-        if not required_bands.issubset(set(available_bands)):
-            raise ValueError(
-                "Sentinel-2 kompoziti gerekli bantları içermiyor. "
-                f"Bulunan bantlar: {available_bands}"
-            )
-        nir, red, green, blue, swir = (
-            composite.select("B8"),
-            composite.select("B4"),
-            composite.select("B3"),
-            composite.select("B2"),
-            composite.select("B11"),
-        )
-        if analysis == "NDVI":
-            image = nir.subtract(red).divide(nir.add(red)).rename("NDVI")
-        elif analysis == "NDWI":
-            image = green.subtract(nir).divide(green.add(nir)).rename("NDWI")
-        elif analysis == "NDMI":
-            image = nir.subtract(swir).divide(nir.add(swir)).rename("NDMI")
-        elif analysis == "NDBI":
-            image = swir.subtract(nir).divide(swir.add(nir)).rename("NDBI")
-        elif analysis == "EVI":
-            image = (
-                nir.subtract(red)
-                .multiply(2.5)
-                .divide(nir.add(red.multiply(6)).subtract(blue.multiply(7.5)).add(1))
-                .rename("EVI")
-            )
-        else:
-            image = (
-                nir.subtract(red).multiply(1.5).divide(nir.add(red).add(0.5)).rename("SAVI")
-            )
-    elif analysis == "LST":
-        landsat = (
-            ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
-            .merge(ee.ImageCollection("LANDSAT/LC09/C02/T1_L2"))
-            .filterBounds(geometry)
-            .filterDate(start, end)
-            .filter(ee.Filter.eq("PROCESSING_LEVEL", "L2SP"))
-            .filter(ee.Filter.lte("CLOUD_COVER", cloud_limit))
-            .map(_mask_landsat_l2)
-        )
-        scene_count = int(landsat.size().getInfo())
-        if scene_count == 0:
-            raise ValueError("Seçilen tarih ve bulut eşiğinde kullanılabilir Landsat LST sahnesi yok.")
-        image = (
-            landsat.select("ST_B10")
-            .median()
-            .multiply(0.00341802)
-            .add(149.0)
-            .subtract(273.15)
-            .rename("LST_C")
-        )
-    else:
-        dem = ee.Image("USGS/SRTMGL1_003").select("elevation")
-        if analysis == "DEM":
-            image = dem.rename("DEM_m")
-        elif analysis == "SLOPE":
-            image = ee.Terrain.slope(dem).rename("SLOPE_deg")
-        elif analysis == "ASPECT":
-            image = ee.Terrain.aspect(dem).rename("ASPECT_deg")
-        else:
-            slope_radians = ee.Terrain.slope(dem).multiply(np.pi / 180).max(0.001)
-            upstream_area_m2 = (
-                ee.Image("MERIT/Hydro/v1_0_1").select("upa").multiply(1_000_000)
-            )
-            specific_catchment_area = upstream_area_m2.divide(92.77).max(1)
-            image = (
-                specific_catchment_area.divide(slope_radians.tan().max(0.001))
-                .log()
-                .rename("TWI")
-            )
-
-    export_scale = _adaptive_scale(gdf, int(spec["native_scale_m"]))
-    metadata = {
-        "analysis": analysis,
-        "source": spec["source"],
-        "formula": spec["formula"],
-        "unit": spec["unit"],
-        "native_scale_m": spec["native_scale_m"],
-        "export_scale_m": export_scale,
-        "scene_count": scene_count,
-        "cloud_limit_percent": cloud_limit if scene_count is not None else None,
-        "period": f"{start_date.isoformat()}/{end_date.isoformat()}",
-        "composite": "median" if scene_count is not None else "static product",
-    }
-    geotiff = _download_analysis_image(
-        image,
-        gdf,
-        export_scale,
-        f"{analysis} analysis",
-        {key: str(value) for key, value in metadata.items() if value is not None},
-    )
-    with MemoryFile(geotiff) as memory:
-        with memory.open() as src:
-            values = src.read(1, masked=True)
-            valid_values = values.compressed()
-            if valid_values.size == 0:
-                raise ValueError(
-                    f"{analysis} rasteri üretildi ancak çalışma alanında geçerli piksel bulunamadı."
-                )
-            raster_min = float(np.nanmin(valid_values))
-            raster_max = float(np.nanmax(valid_values))
-            if analysis == "NDVI" and (raster_min < -1.0001 or raster_max > 1.0001):
-                raise ValueError(
-                    f"NDVI kalite kontrolü başarısız: değer aralığı {raster_min:.4f}/{raster_max:.4f}; "
-                    "beklenen fiziksel aralık −1/+1."
-                )
-            metadata.update(
-                {
-                    "valid_pixel_count": int(valid_values.size),
-                    "raster_min": raster_min,
-                    "raster_max": raster_max,
-                    "raster_crs": str(src.crs),
-                    "raster_width": int(src.width),
-                    "raster_height": int(src.height),
-                }
-            )
-    return geotiff, metadata
-
-
-def _month_starts(start_date: date, end_date: date) -> list[date]:
-    current = start_date.replace(day=1)
-    final = end_date.replace(day=1)
-    dates = []
-    while current <= final:
-        dates.append(current)
-        current += relativedelta(months=1)
-    return dates
-
-
-def fetch_chirps_monthly_mean(
-    gdf: gpd.GeoDataFrame,
-    start_date: date,
-    end_date: date,
-    project: str | None = None,
-) -> pd.DataFrame:
-    ok, message = initialize_gee(project)
-    if not ok:
-        raise RuntimeError("Earth Engine doğrulanmadı: " + message)
-    geometry = _ee_geometry(gdf)
-    centroid_lat, centroid_lon = _centroid_latlon(gdf)
-    collection = ee.ImageCollection(CHIRPS_DAILY)
-    features = []
-    for month in _month_starts(start_date, end_date):
-        following = month + relativedelta(months=1)
-        image = collection.filterDate(month.isoformat(), following.isoformat()).sum()
-        value = image.reduceRegion(
-            reducer=ee.Reducer.mean(),
-            geometry=geometry,
-            scale=CHIRPS_SCALE_M,
-            bestEffort=True,
-            maxPixels=1e9,
-        ).get("precipitation")
-        features.append(ee.Feature(None, {"date": month.isoformat(), "precipitation": value}))
-    info = ee.FeatureCollection(features).getInfo()
-    rows = [
-        {
-            "Tarih": pd.Timestamp(item["properties"]["date"]),
-            "Örnek ID": 1,
-            "Enlem": centroid_lat,
-            "Boylam": centroid_lon,
-            "Toplam yağış (mm)": item["properties"].get("precipitation"),
-        }
-        for item in info["features"]
-    ]
-    return pd.DataFrame(rows)
-
-
-def fetch_gee_monthly_climate(
-    gdf: gpd.GeoDataFrame,
+def fetch_centroid_series(
+    *,
+    latitude: float,
+    longitude: float,
     start_date: date,
     end_date: date,
     variables: list[str],
-    project: str | None = None,
-) -> tuple[pd.DataFrame, list[str]]:
-    """CHIRPS yağışını ve ERA5-Land sıcaklığını havza ortalaması olarak getirir."""
-    ok, message = initialize_gee(project)
-    if not ok:
-        raise RuntimeError("Earth Engine doğrulanmadı: " + message)
-    geometry = _ee_geometry(gdf)
-    centroid_lat, centroid_lon = _centroid_latlon(gdf)
-    chirps = ee.ImageCollection(CHIRPS_DAILY)
-    era5_land = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR")
-    supported = {"Yağış", "Hava sıcaklığı"}
-    unsupported = [item for item in variables if item not in supported]
-    features = []
-    for month in _month_starts(start_date, end_date):
-        following = month + relativedelta(months=1)
-        bands = []
-        if "Yağış" in variables:
-            bands.append(
-                chirps.filterDate(month.isoformat(), following.isoformat())
-                .sum()
-                .rename("precip_mm")
-            )
-        if "Hava sıcaklığı" in variables:
-            bands.append(
-                era5_land.filterDate(month.isoformat(), following.isoformat())
-                .select("temperature_2m")
-                .mean()
-                .subtract(273.15)
-                .rename("temp_c")
-            )
-        if not bands:
-            raise ValueError("GEE bağlantısında en az Yağış veya Hava sıcaklığı seçin.")
-        image = ee.Image(bands[0])
-        for band in bands[1:]:
-            image = image.addBands(band)
-        values = image.reduceRegion(
-            reducer=ee.Reducer.mean(),
-            geometry=geometry,
-            scale=CHIRPS_SCALE_M,
-            bestEffort=True,
-            maxPixels=1e9,
-        )
-        features.append(
-            ee.Feature(
-                None,
-                values.combine(
-                    ee.Dictionary(
-                        {
-                            "date": month.isoformat(),
-                            "sample_id": 1,
-                        }
-                    )
-                ),
-            )
-        )
-    info = ee.FeatureCollection(features).getInfo()
-    rows = []
-    for item in info["features"]:
-        properties = item["properties"]
-        row = {
-            "Tarih": pd.Timestamp(properties["date"]),
-            "Örnek ID": properties["sample_id"],
-            "Enlem": centroid_lat,
-            "Boylam": centroid_lon,
-        }
-        if "precip_mm" in properties:
-            row["Toplam yağış (mm)"] = properties["precip_mm"]
-        if "temp_c" in properties:
-            row["Ortalama sıcaklık (°C)"] = properties["temp_c"]
-        rows.append(row)
-    return pd.DataFrame(rows), unsupported
+    temporal_scale: str,
+) -> ClimateResult:
+    hourly = temporal_scale in {"Saatlik", "3 saatlik", "6 saatlik"}
+    variable_map = HOURLY_VARIABLES if hourly else DAILY_VARIABLES
+    selected: list[str] = []
+    unsupported: list[str] = []
+    for variable in variables:
+        if variable in variable_map:
+            selected.extend(variable_map[variable])
+        else:
+            unsupported.append(variable)
+    selected = list(dict.fromkeys(selected))
+    if not selected:
+        raise ValueError("Seçilen değişkenler Open-Meteo ERA5-Land bağlantısında desteklenmiyor.")
 
+    safe_end = min(end_date, date.today() - timedelta(days=6))
+    if safe_end < start_date:
+        raise ValueError("ERA5-Land arşivi için bitiş tarihi en az 6 gün önce olmalıdır.")
 
-def _rolling_month_image(collection: ee.ImageCollection, month: date, scale_months: int) -> ee.Image:
-    end = month + relativedelta(months=1)
-    start = end - relativedelta(months=scale_months)
-    return (
-        collection.filterDate(start.isoformat(), end.isoformat())
-        .sum()
-        .rename("precipitation")
-        .set({"year": month.year, "month": month.month, "label": month.strftime("%Y_%m")})
-    )
-
-
-def build_chirps_spi_geotiff(
-    gdf: gpd.GeoDataFrame,
-    target_date: date,
-    spi_scale: int,
-    baseline_start: int = 1981,
-    baseline_end: int = 2024,
-    project: str | None = None,
-) -> bytes:
-    ok, message = initialize_gee(project)
-    if not ok:
-        raise RuntimeError("Earth Engine doğrulanmadı: " + message)
-
-    geometry = _ee_geometry(gdf)
-    collection = ee.ImageCollection(CHIRPS_DAILY)
-    target_month = target_date.replace(day=1)
-    baseline_images = []
-    for year in range(baseline_start, baseline_end + 1):
-        month = date(year, target_month.month, 1)
-        baseline_images.append(_rolling_month_image(collection, month, spi_scale))
-    target_is_baseline = baseline_start <= target_month.year <= baseline_end
-    images = baseline_images if target_is_baseline else baseline_images + [
-        _rolling_month_image(collection, target_month, spi_scale)
-    ]
-    stack_image = ee.ImageCollection.fromImages(images).toBands().clip(geometry)
-    url = stack_image.getDownloadURL(
-        {
-            "region": geometry,
-            "scale": CHIRPS_SCALE_M,
-            "format": "GEO_TIFF",
-            "filePerBand": False,
-            "crs": "EPSG:4326",
-        }
-    )
-    response = requests.get(url, timeout=300)
+    key = "hourly" if hourly else "daily"
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "start_date": start_date.isoformat(),
+        "end_date": safe_end.isoformat(),
+        key: ",".join(selected),
+        "timezone": "auto",
+        "models": "era5",
+        "wind_speed_unit": "kmh",
+    }
+    response = requests.get(ARCHIVE_URL, params=params, timeout=180)
     response.raise_for_status()
+    payload = response.json()
+    if payload.get("error"):
+        raise ValueError(payload.get("reason", "Open-Meteo veri hatası"))
 
-    content = response.content
-    if content[:2] == b"PK":
-        with zipfile.ZipFile(io.BytesIO(content)) as archive:
-            tif_name = next(name for name in archive.namelist() if name.lower().endswith(".tif"))
-            content = archive.read(tif_name)
+    values = payload[key]
+    frame = pd.DataFrame(values)
+    frame["time"] = pd.to_datetime(frame["time"])
+    frame = frame.rename(columns={"time": "Tarih", **TURKISH_LABELS})
+    frame = _resample(frame, temporal_scale)
+    frame.insert(1, "Örnek ID", 1)
+    frame.insert(2, "Enlem", float(payload["latitude"]))
+    frame.insert(3, "Boylam", float(payload["longitude"]))
 
-    with MemoryFile(content) as memory:
-        with memory.open() as src:
-            rainfall_stack = src.read().astype(np.float64)
-            profile = src.profile.copy()
-            target_index = target_month.year - baseline_start if target_is_baseline else -1
-            spi = calculate_spi_pixel_stack(rainfall_stack, target_index=target_index)
-            raster_geometry = [
-                geometry.__geo_interface__
-                for geometry in gdf.to_crs(src.crs).geometry
-            ]
-            inside = geometry_mask(
-                raster_geometry,
-                out_shape=(src.height, src.width),
-                transform=src.transform,
-                invert=True,
-            )
-            spi[~inside] = np.nan
-            profile.update(count=1, dtype="float32", nodata=-9999.0, compress="deflate")
-            output = io.BytesIO()
-            with MemoryFile() as out_memory:
-                with out_memory.open(**profile) as dst:
-                    dst.write(np.where(np.isfinite(spi), spi, -9999.0).astype("float32"), 1)
-                    dst.set_band_description(1, f"SPI-{spi_scale} {target_month:%Y-%m}")
-                    dst.update_tags(
-                        source="CHIRPS Daily via Google Earth Engine",
-                        method="Gamma distribution with zero-probability correction",
-                        baseline=f"{baseline_start}-{baseline_end}",
-                    )
-                output.write(out_memory.read())
-            return output.getvalue()
-
-
-def build_climate_geotiff(
-    gdf: gpd.GeoDataFrame,
-    start_date: date,
-    end_date: date,
-    variable: str,
-    project: str | None = None,
-) -> bytes:
-    """Seçilen dönem için gerçek CHIRPS yağış veya ERA5-Land sıcaklık rasteri."""
-    ok, message = initialize_gee(project)
-    if not ok:
-        raise RuntimeError("Earth Engine doğrulanmadı: " + message)
-    geometry = _ee_geometry(gdf)
-    end_exclusive = end_date + relativedelta(days=1)
-
-    if variable == "precipitation":
-        image = (
-            ee.ImageCollection(CHIRPS_DAILY)
-            .filterDate(start_date.isoformat(), end_exclusive.isoformat())
-            .sum()
-            .rename("precip_mm")
-            .clip(geometry)
-        )
-        scale = CHIRPS_SCALE_M
-        description = "CHIRPS period total precipitation (mm)"
-    elif variable == "temperature":
-        image = (
-            ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR")
-            .filterDate(start_date.isoformat(), end_exclusive.isoformat())
-            .select("temperature_2m")
-            .mean()
-            .subtract(273.15)
-            .rename("temp_c")
-            .clip(geometry)
-        )
-        scale = 11132
-        description = "ERA5-Land period mean 2m air temperature (C)"
-    else:
-        raise ValueError(f"Desteklenmeyen iklim raster değişkeni: {variable}")
-
-    url = image.getDownloadURL(
-        {
-            "region": geometry,
-            "scale": scale,
-            "format": "GEO_TIFF",
-            "filePerBand": False,
-            "crs": "EPSG:4326",
-        }
+    return ClimateResult(
+        data=frame,
+        source_url=response.url,
+        latitude=float(payload["latitude"]),
+        longitude=float(payload["longitude"]),
+        elevation_m=payload.get("elevation"),
+        unsupported_variables=unsupported,
+        model="ERA5 (Open-Meteo Historical Weather API)",
     )
-    response = requests.get(url, timeout=300)
-    response.raise_for_status()
-    content = response.content
-    if content[:2] == b"PK":
-        with zipfile.ZipFile(io.BytesIO(content)) as archive:
-            tif_name = next(name for name in archive.namelist() if name.lower().endswith(".tif"))
-            content = archive.read(tif_name)
-
-    with MemoryFile(content) as memory:
-        with memory.open() as src:
-            profile = src.profile.copy()
-            raster_geometry = [
-                geometry.__geo_interface__
-                for geometry in gdf.to_crs(src.crs).geometry
-            ]
-            nodata = -9999.0
-            data, transform = raster_mask(
-                src,
-                raster_geometry,
-                crop=True,
-                filled=True,
-                nodata=nodata,
-            )
-            profile.update(
-                count=1,
-                height=data.shape[1],
-                width=data.shape[2],
-                transform=transform,
-                dtype="float32",
-                nodata=nodata,
-                compress="deflate",
-            )
-            with MemoryFile() as output:
-                with output.open(**profile) as dst:
-                    dst.write(data.astype("float32"))
-                    dst.set_band_description(1, description)
-                    dst.update_tags(
-                        source=(
-                            "CHIRPS Daily via Google Earth Engine"
-                            if variable == "precipitation"
-                            else "ERA5-Land Daily Aggregated via Google Earth Engine"
-                        ),
-                        period=f"{start_date.isoformat()}/{end_date.isoformat()}",
-                        statistic="sum" if variable == "precipitation" else "mean",
-                    )
-                return output.read()
