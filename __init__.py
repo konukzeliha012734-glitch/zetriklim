@@ -1,181 +1,173 @@
-"""Coğrafi dosya okuma, doğrulama ve alan özeti."""
+"""Open-Meteo ERA5-Land bağlantısı ve zaman serisi dönüştürme."""
 
 from __future__ import annotations
 
-import io
-import tempfile
-import zipfile
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterable
+from datetime import date, timedelta
 
-import geopandas as gpd
-import shapefile
-from shapely.geometry import shape as shapely_shape
+import pandas as pd
+import requests
 
 
-REQUIRED_SHAPE_PARTS = {".shp", ".shx", ".dbf"}
-SUPPORTED_SUFFIXES = {".zip", ".shp", ".shx", ".dbf", ".prj", ".cpg", ".gpkg", ".geojson", ".json"}
+ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
+DAILY_VARIABLES = {
+    "Yağış": ["precipitation_sum"],
+    "Hava sıcaklığı": ["temperature_2m_mean", "temperature_2m_min", "temperature_2m_max"],
+    "Bağıl nem": ["relative_humidity_2m_mean"],
+    "Çiy noktası": ["dew_point_2m_mean"],
+    "Rüzgâr hızı ve yönü": ["wind_speed_10m_mean", "wind_speed_10m_max", "wind_direction_10m_dominant"],
+    "Buharlaşma / gerçek ET": ["et0_fao_evapotranspiration"],
+    "Potansiyel evapotranspirasyon": ["et0_fao_evapotranspiration"],
+    "Yüzey / deniz seviyesi basıncı": ["surface_pressure_mean", "pressure_msl_mean"],
+    "Toprak nemi": ["soil_moisture_0_to_7cm_mean", "soil_moisture_7_to_28cm_mean"],
+    "Kar örtüsü / kar su eşdeğeri": ["snowfall_sum", "snowfall_water_equivalent_sum"],
+    "Güneş radyasyonu": ["shortwave_radiation_sum"],
+    "Bulutluluk": ["cloud_cover_mean"],
+}
 
-class GeometryUploadError(ValueError):
-    """Yüklenen mekânsal veri doğrulanamadığında üretilir."""
+HOURLY_VARIABLES = {
+    "Yağış": ["precipitation"],
+    "Hava sıcaklığı": ["temperature_2m"],
+    "Bağıl nem": ["relative_humidity_2m"],
+    "Çiy noktası": ["dew_point_2m"],
+    "Rüzgâr hızı ve yönü": ["wind_speed_10m", "wind_direction_10m"],
+    "Buharlaşma / gerçek ET": ["et0_fao_evapotranspiration"],
+    "Potansiyel evapotranspirasyon": ["et0_fao_evapotranspiration"],
+    "Yüzey / deniz seviyesi basıncı": ["surface_pressure", "pressure_msl"],
+    "Toprak nemi": ["soil_moisture_0_to_7cm", "soil_moisture_7_to_28cm"],
+    "Kar örtüsü / kar su eşdeğeri": ["snowfall", "snow_depth"],
+    "Güneş radyasyonu": ["shortwave_radiation"],
+    "Bulutluluk": ["cloud_cover"],
+}
+
+TURKISH_LABELS = {
+    "temperature_2m": "Sıcaklık (°C)",
+    "temperature_2m_mean": "Ortalama sıcaklık (°C)",
+    "temperature_2m_min": "Minimum sıcaklık (°C)",
+    "temperature_2m_max": "Maksimum sıcaklık (°C)",
+    "precipitation": "Yağış (mm)",
+    "precipitation_sum": "Toplam yağış (mm)",
+    "relative_humidity_2m": "Bağıl nem (%)",
+    "relative_humidity_2m_mean": "Ortalama bağıl nem (%)",
+    "dew_point_2m": "Çiy noktası (°C)",
+    "dew_point_2m_mean": "Ortalama çiy noktası (°C)",
+    "wind_speed_10m": "Rüzgâr hızı (km/sa)",
+    "wind_speed_10m_mean": "Ortalama rüzgâr hızı (km/sa)",
+    "wind_speed_10m_max": "Maksimum rüzgâr hızı (km/sa)",
+    "wind_direction_10m": "Rüzgâr yönü (°)",
+    "wind_direction_10m_dominant": "Baskın rüzgâr yönü (°)",
+    "et0_fao_evapotranspiration": "Referans ET₀ (mm)",
+    "surface_pressure": "Yüzey basıncı (hPa)",
+    "surface_pressure_mean": "Ortalama yüzey basıncı (hPa)",
+    "pressure_msl": "Deniz seviyesi basıncı (hPa)",
+    "pressure_msl_mean": "Ortalama deniz seviyesi basıncı (hPa)",
+    "soil_moisture_0_to_7cm": "Toprak nemi 0–7 cm (m³/m³)",
+    "soil_moisture_0_to_7cm_mean": "Ortalama toprak nemi 0–7 cm (m³/m³)",
+    "soil_moisture_7_to_28cm": "Toprak nemi 7–28 cm (m³/m³)",
+    "soil_moisture_7_to_28cm_mean": "Ortalama toprak nemi 7–28 cm (m³/m³)",
+    "snowfall": "Kar yağışı (cm)",
+    "snowfall_sum": "Toplam kar yağışı (cm)",
+    "snow_depth": "Kar kalınlığı (m)",
+    "snowfall_water_equivalent_sum": "Kar su eşdeğeri (mm)",
+    "shortwave_radiation": "Kısa dalga radyasyon (W/m²)",
+    "shortwave_radiation_sum": "Kısa dalga radyasyon (MJ/m²)",
+    "cloud_cover": "Bulutluluk (%)",
+    "cloud_cover_mean": "Ortalama bulutluluk (%)",
+}
 
 
 @dataclass
-class UploadedPart:
-    name: str
-    content: bytes
+class ClimateResult:
+    data: pd.DataFrame
+    source_url: str
+    latitude: float
+    longitude: float
+    elevation_m: float | None
+    unsupported_variables: list[str]
+    model: str
 
 
-@dataclass
-class GeometrySummary:
-    gdf_wgs84: gpd.GeoDataFrame
-    area_km2: float
-    perimeter_km: float
-    source_crs: str
-    area_crs: str
-    feature_count: int
-    vertex_count: int
-    was_repaired: bool
-
-    @property
-    def bounds(self) -> list[float]:
-        return self.gdf_wgs84.total_bounds.tolist()
-
-    @property
-    def centroid(self) -> tuple[float, float]:
-        geom = self.gdf_wgs84[["geometry"]].dissolve().to_crs(self.area_crs).geometry.iloc[0]
-        point = gpd.GeoSeries([geom.centroid], crs=self.area_crs).to_crs(4326).iloc[0]
-        return point.y, point.x
-
-
-def _safe_extract_zip(content: bytes, destination: Path) -> None:
-    try:
-        archive = zipfile.ZipFile(io.BytesIO(content))
-    except zipfile.BadZipFile as exc:
-        raise GeometryUploadError("Yüklenen ZIP arşivi geçerli değil.") from exc
-    for item in archive.infolist():
-        if item.is_dir():
-            continue
-        target = (destination / item.filename).resolve()
-        if destination.resolve() not in target.parents:
-            raise GeometryUploadError("ZIP içinde güvenli olmayan bir dosya yolu var.")
-        archive.extract(item, destination)
+def _resample(data: pd.DataFrame, temporal_scale: str) -> pd.DataFrame:
+    if temporal_scale in {"Saatlik", "Günlük"}:
+        return data
+    rules = {
+        "3 saatlik": "3h",
+        "6 saatlik": "6h",
+        "Haftalık": "W",
+        "Aylık": "MS",
+        "Mevsimlik": "QS-DEC",
+        "Yıllık": "YS",
+    }
+    rule = rules.get(temporal_scale)
+    if not rule:
+        return data
+    numeric = data.set_index("Tarih")
+    aggregations = {}
+    for column in numeric.columns:
+        lower = column.lower()
+        aggregations[column] = "sum" if any(word in lower for word in ["yağış", "et₀", "radyasyon", "kar yağışı"]) else "mean"
+    return numeric.resample(rule).agg(aggregations).reset_index()
 
 
-def _find_dataset(folder: Path) -> Path:
-    gpkg = list(folder.rglob("*.gpkg"))
-    geojson = list(folder.rglob("*.geojson")) + list(folder.rglob("*.json"))
-    shp = list(folder.rglob("*.shp"))
-    candidates = gpkg + geojson + shp
-    if len(candidates) != 1:
-        raise GeometryUploadError(
-            "Tek bir çalışma alanı yükleyin. Desteklenen ana dosyalar: "
-            ".gpkg, .geojson veya .shp."
-        )
-    dataset = candidates[0]
-    if dataset.suffix.lower() == ".shp":
-        existing = {p.suffix.lower() for p in dataset.parent.glob(f"{dataset.stem}.*")}
-        missing = REQUIRED_SHAPE_PARTS - existing
-        if missing:
-            raise GeometryUploadError(
-                "Shapefile bileşenleri eksik: " + ", ".join(sorted(missing))
-            )
-    return dataset
-
-
-def _count_vertices(geometry) -> int:
-    if geometry is None or geometry.is_empty:
-        return 0
-    if geometry.geom_type == "Polygon":
-        return len(geometry.exterior.coords) + sum(len(r.coords) for r in geometry.interiors)
-    if geometry.geom_type == "MultiPolygon":
-        return sum(_count_vertices(part) for part in geometry.geoms)
-    return 0
-
-
-def _read_single_shp(content: bytes, fallback_crs: str) -> gpd.GeoDataFrame:
-    try:
-        reader = shapefile.Reader(shp=io.BytesIO(content))
-        geometries = [
-            shapely_shape(item.__geo_interface__)
-            for item in reader.shapes()
-            if item.shapeType != shapefile.NULL
-        ]
-    except Exception as exc:
-        raise GeometryUploadError(f"Tek SHP geometrisi okunamadı: {exc}") from exc
-    if not geometries:
-        raise GeometryUploadError("SHP dosyasında poligon geometrisi bulunamadı.")
-    return gpd.GeoDataFrame(
-        {"kaynak": ["tek_shp"] * len(geometries)},
-        geometry=geometries,
-        crs=fallback_crs,
-    )
-
-
-def inspect_uploaded_files(
-    files: Iterable[UploadedPart],
-    fallback_crs: str = "EPSG:4326",
-) -> GeometrySummary:
-    parts = list(files)
-    if not parts:
-        raise GeometryUploadError("En az bir coğrafi dosya seçin.")
-
-    with tempfile.TemporaryDirectory(prefix="zetriklim_") as temp:
-        folder = Path(temp)
-        for part in parts:
-            suffix = Path(part.name).suffix.lower()
-            if suffix not in SUPPORTED_SUFFIXES:
-                continue
-            if suffix == ".zip":
-                _safe_extract_zip(part.content, folder)
-            else:
-                safe_name = Path(part.name).name
-                (folder / safe_name).write_bytes(part.content)
-
-        shp_parts = [part for part in parts if Path(part.name).suffix.lower() == ".shp"]
-        non_zip_parts = [
-            part for part in parts if Path(part.name).suffix.lower() not in {".zip"}
-        ]
-        if len(shp_parts) == 1 and len(non_zip_parts) == 1:
-            gdf = _read_single_shp(shp_parts[0].content, fallback_crs)
+def fetch_centroid_series(
+    *,
+    latitude: float,
+    longitude: float,
+    start_date: date,
+    end_date: date,
+    variables: list[str],
+    temporal_scale: str,
+) -> ClimateResult:
+    hourly = temporal_scale in {"Saatlik", "3 saatlik", "6 saatlik"}
+    variable_map = HOURLY_VARIABLES if hourly else DAILY_VARIABLES
+    selected: list[str] = []
+    unsupported: list[str] = []
+    for variable in variables:
+        if variable in variable_map:
+            selected.extend(variable_map[variable])
         else:
-            dataset = _find_dataset(folder)
-            try:
-                gdf = gpd.read_file(dataset)
-            except Exception as exc:
-                raise GeometryUploadError(f"Coğrafi dosya okunamadı: {exc}") from exc
+            unsupported.append(variable)
+    selected = list(dict.fromkeys(selected))
+    if not selected:
+        raise ValueError("Seçilen değişkenler Open-Meteo ERA5-Land bağlantısında desteklenmiyor.")
 
-        if gdf.empty or gdf.geometry.is_empty.all():
-            raise GeometryUploadError("Dosya geçerli bir geometri içermiyor.")
-        if gdf.crs is None:
-            raise GeometryUploadError("Koordinat sistemi tanımlı değil. SHP için .prj dosyasını ekleyin.")
-        if not set(gdf.geom_type.dropna()).issubset({"Polygon", "MultiPolygon"}):
-            raise GeometryUploadError("Çalışma alanı Polygon veya MultiPolygon olmalı.")
+    safe_end = min(end_date, date.today() - timedelta(days=6))
+    if safe_end < start_date:
+        raise ValueError("ERA5-Land arşivi için bitiş tarihi en az 6 gün önce olmalıdır.")
 
-        repaired = bool((~gdf.geometry.is_valid).any())
-        if repaired:
-            gdf.geometry = gdf.geometry.make_valid()
+    key = "hourly" if hourly else "daily"
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "start_date": start_date.isoformat(),
+        "end_date": safe_end.isoformat(),
+        key: ",".join(selected),
+        "timezone": "auto",
+        "models": "era5",
+        "wind_speed_unit": "kmh",
+    }
+    response = requests.get(ARCHIVE_URL, params=params, timeout=180)
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("error"):
+        raise ValueError(payload.get("reason", "Open-Meteo veri hatası"))
 
-        source_crs = gdf.crs.to_string()
-        gdf_wgs84 = gdf.to_crs(4326)
-        area_crs_obj = gdf_wgs84.estimate_utm_crs() or "EPSG:6933"
-        dissolved = gdf_wgs84[["geometry"]].dissolve().to_crs(area_crs_obj)
-        geometry = dissolved.geometry.iloc[0]
+    values = payload[key]
+    frame = pd.DataFrame(values)
+    frame["time"] = pd.to_datetime(frame["time"])
+    frame = frame.rename(columns={"time": "Tarih", **TURKISH_LABELS})
+    frame = _resample(frame, temporal_scale)
+    frame.insert(1, "Örnek ID", 1)
+    frame.insert(2, "Enlem", float(payload["latitude"]))
+    frame.insert(3, "Boylam", float(payload["longitude"]))
 
-        return GeometrySummary(
-            gdf_wgs84=gdf_wgs84,
-            area_km2=float(geometry.area / 1_000_000),
-            perimeter_km=float(geometry.length / 1_000),
-            source_crs=source_crs,
-            area_crs=str(area_crs_obj),
-            feature_count=len(gdf_wgs84),
-            vertex_count=sum(_count_vertices(g) for g in gdf_wgs84.geometry),
-            was_repaired=repaired,
-        )
-
-
-def inspect_zipped_shapefile(content: bytes) -> GeometrySummary:
-    """Eski çağrılar için geriye uyumlu yardımcı."""
-    return inspect_uploaded_files([UploadedPart("area.zip", content)])
+    return ClimateResult(
+        data=frame,
+        source_url=response.url,
+        latitude=float(payload["latitude"]),
+        longitude=float(payload["longitude"]),
+        elevation_m=payload.get("elevation"),
+        unsupported_variables=unsupported,
+        model="ERA5 (Open-Meteo Historical Weather API)",
+    )

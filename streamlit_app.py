@@ -45,7 +45,6 @@ from zetriklim.spi import calculate_spi_table
 
 
 ROOT = Path(__file__).parent
-LOGO = ROOT / "assets" / "zetriklim-icon.png"
 
 st.set_page_config(
     page_title="Zetriklim | Havza ve iklim analizi",
@@ -132,10 +131,13 @@ st.markdown(
       margin-top:.35rem; color:#47717a; font-size:.68rem; line-height:1.25;
       font-weight:700; letter-spacing:.06em; text-align:center;
     }
-    .brand-fallback {
-      width:112px;height:112px;margin:0 auto;border:5px solid #063f55;
-      border-radius:44% 56% 48% 52%;display:grid;place-items:center;
-      color:#00a6a6;font-size:2.7rem;font-weight:900;background:#f9fcfa;
+    .brand-logo-shell {
+      width:174px;max-width:100%;margin:0 auto;padding:.35rem;
+      background:rgba(255,255,255,.72);border-radius:22px;
+      box-shadow:0 9px 26px rgba(6,47,64,.08);
+    }
+    .brand-logo-shell svg {
+      display:block;width:100%;height:auto;
     }
     @media (max-width:800px) { .workflow { grid-template-columns:1fr 1fr; } }
     .stButton > button, .stDownloadButton > button {
@@ -154,12 +156,42 @@ if "uploader_nonce" not in st.session_state:
 
 top_logo, top_hero = st.columns([0.16, 0.84], vertical_alignment="center")
 with top_logo:
-    if LOGO.exists():
-        st.image(str(LOGO), width=170)
-    else:
-        st.markdown('<div class="brand-fallback">Z</div>', unsafe_allow_html=True)
     st.markdown(
         """
+        <div class="brand-logo-shell" role="img" aria-label="Zetriklim coğrafi analiz logosu">
+          <svg viewBox="0 0 220 210" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <linearGradient id="zg" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stop-color="#35c8d0"/>
+                <stop offset="1" stop-color="#00a68f"/>
+              </linearGradient>
+              <clipPath id="zb">
+                <path d="M48 18 L146 20 L166 57 L199 76 L196 142 L175 174
+                         L129 188 L79 181 L31 151 L24 94 Z"/>
+              </clipPath>
+            </defs>
+            <path d="M48 18 L146 20 L166 57 L199 76 L196 142 L175 174
+                     L129 188 L79 181 L31 151 L24 94 Z"
+                  fill="#fbfdf9" stroke="#063f55" stroke-width="8" stroke-linejoin="round"/>
+            <g clip-path="url(#zb)" fill="none" stroke="#35c8d0" stroke-width="4">
+              <path d="M8 52 C38 30 51 72 78 48 S124 28 150 45"/>
+              <path d="M4 75 C34 52 49 95 78 69 S126 49 164 65"/>
+              <path d="M7 101 C38 77 53 120 82 95 S126 75 166 88"/>
+              <path d="M12 127 C39 104 56 145 84 121 S128 101 169 112"/>
+            </g>
+            <g clip-path="url(#zb)" fill="url(#zg)" stroke="#ffffff" stroke-width="2">
+              <rect x="84" y="148" width="22" height="22"/><rect x="108" y="148" width="22" height="22"/>
+              <rect x="132" y="148" width="22" height="22"/><rect x="156" y="148" width="22" height="22"/>
+              <rect x="108" y="124" width="22" height="22"/><rect x="132" y="124" width="22" height="22"/>
+              <rect x="156" y="124" width="22" height="22"/><rect x="132" y="100" width="22" height="22"/>
+              <rect x="156" y="100" width="22" height="22"/><rect x="156" y="76" width="22" height="22"/>
+            </g>
+            <circle cx="104" cy="101" r="18" fill="#ffffff" stroke="#063f55" stroke-width="6"/>
+            <circle cx="104" cy="101" r="9" fill="#ffb51b"/>
+            <path d="M123 101 H151 M104 120 V142" stroke="#063f55" stroke-width="5"
+                  stroke-linecap="round" stroke-dasharray="1 10"/>
+          </svg>
+        </div>
         <div class="brand-name">ZETRİKLİM</div>
         <div class="brand-subtitle">COĞRAFİ ANALİZ PLATFORMU</div>
         """,

@@ -1,173 +1,341 @@
-"""Açık veri kaynakları, değişkenler ve ayrıntılı analiz kataloğu."""
+"""Climate Engine API bağlantısı ve kullanıcı anahtarı doğrulaması."""
 
-SOURCES = {
-    "Otomatik en uygun açık kaynak": {
-        "status": "Hazır",
-        "description": "Değişken, dönem, konum ve çözünürlüğe göre uygun ürün önerilir.",
-        "products": ["Otomatik ürün eşleştirme"],
-    },
-    "Climate Engine": {
-        "status": "API anahtarı gerekli",
-        "description": "CHIRPS, ERA5, MODIS ve diğer ürünlere ortak analiz arayüzü.",
-        "products": ["CHIRPS Daily", "ERA5", "ERA5-Land", "TerraClimate", "MODIS", "Landsat", "Sentinel-2"],
-    },
-    "Google Earth Engine": {
-        "status": "OAuth kullanıcı girişi gerekli",
-        "description": "CHIRPS, ERA5-Land, Sentinel, Landsat ve MODIS raster koleksiyonları.",
-        "products": ["CHIRPS Daily", "ERA5-Land Daily", "Sentinel-2", "Landsat Collection 2", "MODIS"],
-    },
-    "Copernicus Climate Data Store": {
-        "status": "Ücretsiz hesap gerekli",
-        "description": "ERA5/ERA5-Land ve iklim projeksiyonlarının üretici dağıtım noktası.",
-        "products": ["ERA5 Hourly", "ERA5-Land Hourly", "ERA5 Monthly", "CMIP6"],
-    },
-    "CHIRPS / UCSB Climate Hazards Center": {
-        "status": "Açık erişim",
-        "description": "1981'den günümüze istasyon destekli küresel yağış.",
-        "products": ["CHIRPS Daily", "CHIRPS Pentad", "CHIRPS Monthly"],
-    },
-    "NASA Earthdata": {
-        "status": "Ücretsiz hesap gerekli",
-        "description": "Uydu, hidroloji, arazi yüzeyi ve atmosfer ürünleri.",
-        "products": ["GPM IMERG", "MODIS", "SMAP", "GLDAS", "MERRA-2", "GRACE"],
-    },
-    "NASA POWER": {
-        "status": "Açık erişim",
-        "description": "Noktasal ve bölgesel agroklimatolojik meteoroloji serileri.",
-        "products": ["POWER Daily", "POWER Hourly", "POWER Monthly"],
-    },
-    "NOAA": {
-        "status": "Açık erişim",
-        "description": "Gözlem, yeniden analiz, deniz yüzeyi ve iklim ürünleri.",
-        "products": ["NCEP/NCAR", "CPC", "CMORPH", "OISST", "GHCN"],
-    },
-    "Open-Meteo Historical": {
-        "status": "Açık erişim",
-        "description": "ERA5 tabanlı geçmiş hava serilerine hızlı API erişimi.",
-        "products": ["Historical Weather API", "Climate API"],
-    },
-    "ESA Copernicus Data Space": {
-        "status": "Ücretsiz hesap gerekli",
-        "description": "Sentinel uydu verileri ve Copernicus servisleri.",
-        "products": ["Sentinel-1", "Sentinel-2", "Sentinel-3", "Copernicus DEM"],
-    },
-    "USGS EarthExplorer": {
-        "status": "Ücretsiz hesap gerekli",
-        "description": "Landsat, SRTM ve uzun dönemli yeryüzü gözlemleri.",
-        "products": ["Landsat Collection 2", "SRTM", "ASTER GDEM"],
-    },
-    "Yerel dosya": {
-        "status": "Hazır",
-        "description": "CSV, Excel, NetCDF veya GeoTIFF verisini analiz eder.",
-        "products": ["CSV", "Excel", "NetCDF", "GeoTIFF"],
-    },
+from __future__ import annotations
+
+import os
+import json
+from datetime import timedelta
+from typing import Any
+
+import geopandas as gpd
+import pandas as pd
+import requests
+
+
+BASE_URL = "https://api.climateengine.org"
+
+DATASET_START_DATES = {
+    "CHIRPS_DAILY": "1981-01-01",
+    "CHIRPS_PENTAD": "1981-01-01",
+    "CHIRPS_PRELIM_PENTAD": "2015-01-01",
+    "ERA5_AG": "1979-01-01",
+    "SENTINEL2_SR": "2015-01-01",
+    "HLS_SR": "2013-04-11",
+    "LANDSAT_SR": "1984-01-01",
+    "LANDSAT8_SR": "2013-04-11",
+    "MODIS_TERRA_8DAY": "2000-02-18",
 }
 
-VARIABLES = {
-    "Yağış": ["CHIRPS Daily", "GPM IMERG", "ERA5-Land Hourly", "CMORPH", "TerraClimate"],
-    "Hava sıcaklığı": ["ERA5 Hourly", "ERA5-Land Hourly", "POWER Daily", "TerraClimate"],
-    "Yüzey sıcaklığı (LST)": ["MODIS", "Sentinel-3", "Landsat Collection 2"],
-    "Bağıl nem": ["ERA5 Hourly", "MERRA-2", "POWER Hourly"],
-    "Çiy noktası": ["ERA5 Hourly", "ERA5-Land Hourly", "MERRA-2"],
-    "Rüzgâr hızı ve yönü": ["ERA5 Hourly", "ERA5-Land Hourly", "MERRA-2"],
-    "Buharlaşma / gerçek ET": ["ERA5-Land Hourly", "MODIS", "GLDAS"],
-    "Potansiyel evapotranspirasyon": ["ERA5-Land Hourly", "TerraClimate", "POWER Daily"],
-    "Yüzey / deniz seviyesi basıncı": ["ERA5 Hourly", "MERRA-2", "POWER Hourly"],
-    "Toprak nemi": ["SMAP", "ERA5-Land Hourly", "GLDAS"],
-    "Kar örtüsü / kar su eşdeğeri": ["MODIS", "ERA5-Land Hourly", "GLDAS"],
-    "Güneş radyasyonu": ["ERA5-Land Hourly", "POWER Daily", "MERRA-2"],
-    "Bulutluluk": ["ERA5 Hourly", "MODIS", "Sentinel-3"],
-    "NDVI / EVI": ["Sentinel-2", "MODIS", "Landsat Collection 2"],
-    "NDWI / yüzey suyu": ["Sentinel-2", "Landsat Collection 2", "MODIS"],
-    "Arazi örtüsü": ["ESA WorldCover", "MODIS", "Copernicus Global Land Cover"],
-    "Yükselti / eğim / bakı": ["Copernicus DEM", "SRTM", "ASTER GDEM"],
-    "Yeraltı suyu depolama anomalisi": ["GRACE"],
-}
 
-ANALYSES = {
-    "Kuraklık indisleri": ["SPI", "SPEI", "PDSI", "scPDSI", "EDDI", "RDI", "Z-indeksi"],
-    "Kuraklık olay karakteri": ["Süre", "Şiddet", "Yoğunluk", "Sıklık", "Başlangıç-bitiş", "Alan yayılımı"],
-    "Eğilim ve homojenlik": ["Mann–Kendall", "Mevsimsel Mann–Kendall", "Sen eğimi", "Pettitt değişim noktası", "SNHT", "Buishand"],
-    "İklim uçları (ETCCDI)": ["CDD", "CWD", "R10mm", "R20mm", "Rx1day", "Rx5day", "TX90p", "TN10p", "WSDI", "CSDI", "Don günü"],
-    "Hidroklimatoloji": ["Su dengesi", "Akış katsayısı", "Yağış anomalisi", "ET anomalisi", "Toprak nemi anomalisi"],
-    "Uzaktan algılama indisleri": ["NDVI", "NDWI", "NDMI", "NDBI", "EVI", "SAVI", "LST"],
-    "Topoğrafik ve hidrolojik türevler": ["DEM", "SLOPE", "ASPECT", "TWI"],
-    "Bitki ve yüzey": ["VHI", "VCI", "TCI", "Yağış-bitki gecikmeli korelasyonu"],
-    "Mekânsal istatistik": ["Zonal istatistik", "Moran's I", "Getis-Ord Gi*", "IDW", "Kriging", "Yükseklik kuşakları"],
-    "Föhn ve topoğrafya": ["Rüzgâr üstü-altı farkı", "Sıcaklık-nem farkı", "Rüzgârın sırta dik bileşeni", "Föhn olay sınıflaması"],
-}
+def api_key_available(api_key: str | None = None) -> bool:
+    return bool(api_key or os.getenv("CLIMATE_ENGINE_API_KEY"))
 
-ANALYSIS_METHODS = {
-    "SPI": {
-        "title": "Standartlaştırılmış Yağış İndisi",
-        "source": "CHIRPS Daily",
-        "resolution": "~5,5 km",
-        "purpose": "Meteorolojik kuraklığın farklı zaman ölçeklerinde izlenmesi",
-    },
-    "NDVI": {
-        "title": "Normalize Edilmiş Fark Bitki Örtüsü İndisi",
-        "source": "Sentinel-2 L2A",
-        "resolution": "10 m",
-        "purpose": "Bitki örtüsü canlılığı ve yoğunluğu",
-    },
-    "NDWI": {
-        "title": "Normalize Edilmiş Fark Su İndisi",
-        "source": "Sentinel-2 L2A",
-        "resolution": "10 m",
-        "purpose": "Açık su yüzeylerinin belirlenmesi",
-    },
-    "NDMI": {
-        "title": "Normalize Edilmiş Fark Nem İndisi",
-        "source": "Sentinel-2 L2A",
-        "resolution": "20 m",
-        "purpose": "Vejetasyon ve yüzey nemi",
-    },
-    "NDBI": {
-        "title": "Normalize Edilmiş Fark Yapılaşma İndisi",
-        "source": "Sentinel-2 L2A",
-        "resolution": "20 m",
-        "purpose": "Yapılaşmış alanların belirlenmesi",
-    },
-    "EVI": {
-        "title": "Geliştirilmiş Bitki Örtüsü İndisi",
-        "source": "Sentinel-2 L2A",
-        "resolution": "10 m",
-        "purpose": "Yoğun bitki örtüsünde geliştirilmiş duyarlılık",
-    },
-    "SAVI": {
-        "title": "Toprak Ayarlı Bitki Örtüsü İndisi",
-        "source": "Sentinel-2 L2A",
-        "resolution": "10 m",
-        "purpose": "Seyrek bitki örtüsünde toprak etkisinin azaltılması",
-    },
-    "LST": {
-        "title": "Arazi Yüzey Sıcaklığı",
-        "source": "Landsat 8/9 Collection 2 L2",
-        "resolution": "30 m",
-        "purpose": "Termal yüzey örüntüsü ve sıcaklık anomalileri",
-    },
-    "DEM": {
-        "title": "Sayısal Yükseklik Modeli",
-        "source": "SRTM V3",
-        "resolution": "30 m",
-        "purpose": "Yükselti dağılımı",
-    },
-    "SLOPE": {
-        "title": "Eğim",
-        "source": "SRTM V3",
-        "resolution": "30 m",
-        "purpose": "Topoğrafik eğim derecesi",
-    },
-    "ASPECT": {
-        "title": "Bakı",
-        "source": "SRTM V3",
-        "resolution": "30 m",
-        "purpose": "Yamaç yönelimi",
-    },
-    "TWI": {
-        "title": "Topoğrafik Nem İndisi",
-        "source": "MERIT Hydro + SRTM",
-        "resolution": "~90 m",
-        "purpose": "Topoğrafik su birikme potansiyeli",
-    },
-}
+
+def connection_label(api_key: str | None = None) -> str:
+    return "Bağlı" if api_key_available(api_key) else "API anahtarı bekleniyor"
+
+
+def validate_api_key(api_key: str) -> dict[str, Any]:
+    """Anahtarı Climate Engine'in resmi doğrulama uç noktasında sınar."""
+    response = requests.get(
+        f"{BASE_URL}/home/validate_key",
+        headers={"Authorization": api_key.strip()},
+        timeout=30,
+    )
+    if response.status_code in {401, 403}:
+        raise ValueError("API anahtarı geçersiz veya bu işlem için yetkisiz.")
+    response.raise_for_status()
+    try:
+        validation = response.json()
+    except ValueError:
+        validation = {"message": response.text.strip() or "Anahtar doğrulandı."}
+
+    expiration_response = requests.get(
+        f"{BASE_URL}/home/key_expiration",
+        headers={"Authorization": api_key.strip()},
+        timeout=30,
+    )
+    expiration = None
+    if expiration_response.ok:
+        try:
+            expiration = expiration_response.json()
+        except ValueError:
+            expiration = expiration_response.text.strip()
+    return {"validation": validation, "expiration": expiration}
+
+
+def fetch_timeseries(
+    api_key: str,
+    gdf: gpd.GeoDataFrame,
+    start_date,
+    end_date,
+    dataset: str,
+    variables: str,
+    area_reducer: str = "mean",
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Yüklenen alan için Climate Engine native zaman serisini getirir."""
+    if gdf.empty or gdf.crs is None:
+        raise ValueError("Çalışma alanı boş veya koordinat sistemi tanımsız.")
+    wgs84 = gdf.to_crs(4326).copy()
+    wgs84["geometry"] = wgs84.geometry.make_valid()
+    wgs84 = wgs84[
+        ~wgs84.geometry.is_empty
+        & wgs84.geometry.geom_type.isin(["Polygon", "MultiPolygon"])
+    ]
+    if wgs84.empty:
+        raise ValueError("Çalışma alanında geçerli Polygon veya MultiPolygon geometrisi bulunamadı.")
+
+    requested_start = pd.Timestamp(start_date).date()
+    requested_end = pd.Timestamp(end_date).date()
+    dataset_start = DATASET_START_DATES.get(dataset.strip())
+    if dataset_start and requested_start < pd.Timestamp(dataset_start).date():
+        raise ValueError(
+            f"{dataset} veri ürünü {dataset_start} tarihinde başlar; "
+            f"{requested_start}/{requested_end} dönemi bu ürünle sorgulanamaz."
+        )
+
+    metric_crs = wgs84.estimate_utm_crs() or "EPSG:6933"
+    metric_geometry = wgs84[["geometry"]].dissolve().to_crs(metric_crs)
+    tolerance = 0
+    candidate = metric_geometry.to_crs(4326).geometry.iloc[0]
+    coordinates = json.dumps(candidate.__geo_interface__["coordinates"])
+    while len(coordinates) > 80_000 and tolerance < 10_000:
+        tolerance = 100 if tolerance == 0 else tolerance * 2
+        candidate = (
+            metric_geometry.simplify(tolerance, preserve_topology=True)
+            .to_crs(4326)
+            .iloc[0]
+        )
+        coordinates = json.dumps(candidate.__geo_interface__["coordinates"])
+    endpoint = f"{BASE_URL}/timeseries/native/coordinates"
+    headers = {"Authorization": api_key.strip()}
+
+    def request_period(period_start, period_end) -> tuple[list[dict], dict[str, Any]]:
+        payload = {
+            "coordinates": coordinates,
+            "area_reducer": area_reducer,
+            "dataset": dataset.strip(),
+            "variable": variables.strip(),
+            "start_date": str(period_start),
+            "end_date": str(period_end),
+        }
+        response = requests.post(endpoint, headers=headers, json=payload, timeout=300)
+        if response.status_code in {401, 403}:
+            raise ValueError(
+                "Climate Engine anahtarı geçersiz, süresi dolmuş veya kotası yetersiz."
+            )
+        if not response.ok:
+            try:
+                error_detail = response.json()
+            except ValueError:
+                error_detail = response.text.strip()
+            error_text = str(error_detail)
+            span_days = (period_end - period_start).days
+            if "No data returned" in error_text:
+                available_from = DATASET_START_DATES.get(dataset.strip(), "ürünün katalog başlangıcı")
+                raise ValueError(
+                    f"{dataset} için {period_start}/{period_end} döneminde veri bulunamadı. "
+                    f"Bilinen başlangıç: {available_from}. Tarih aralığını, bulutluluk durumunu "
+                    "ve çalışma alanının ürün kapsamı içinde olduğunu kontrol edin."
+                )
+            if (
+                response.status_code >= 500
+                and "Response size exceeds limit" in error_text
+                and span_days > 31
+            ):
+                midpoint = period_start + timedelta(days=span_days // 2)
+                left_records, left_meta = request_period(period_start, midpoint)
+                right_records, right_meta = request_period(
+                    midpoint + timedelta(days=1), period_end
+                )
+                return left_records + right_records, {
+                    "split": True,
+                    "parts": [left_meta, right_meta],
+                }
+            raise RuntimeError(
+                f"Climate Engine isteği başarısız (HTTP {response.status_code}). "
+                f"Dataset={dataset}, değişken={variables}, dönem={period_start}/{period_end}, "
+                f"geometri={len(coordinates):,} karakter, sadeleştirme={tolerance} m. "
+                f"Servis yanıtı: {error_text[:1200]}"
+            )
+        body = response.json()
+        series_groups = body.get("Data")
+        if not series_groups:
+            return [], {
+                key: value for key, value in body.items() if key != "Data"
+            }
+        first_group = series_groups[0] if isinstance(series_groups, list) else series_groups
+        records = first_group.get("Data") if isinstance(first_group, dict) else first_group
+        if isinstance(records, dict):
+            normalized_records = pd.DataFrame.from_dict(records).to_dict("records")
+        else:
+            normalized_records = list(records or [])
+        return normalized_records, {
+            key: value for key, value in body.items() if key != "Data"
+        }
+
+    all_records: list[dict] = []
+    chunk_metadata = []
+    chunk_start = requested_start
+    while chunk_start <= requested_end:
+        chunk_end = min(
+            (pd.Timestamp(chunk_start) + pd.DateOffset(years=5) - pd.Timedelta(days=1)).date(),
+            requested_end,
+        )
+        records, response_metadata = request_period(chunk_start, chunk_end)
+        all_records.extend(records)
+        chunk_metadata.append(
+            {
+                "start": str(chunk_start),
+                "end": str(chunk_end),
+                "record_count": len(records),
+                "metadata": response_metadata,
+            }
+        )
+        chunk_start = chunk_end + timedelta(days=1)
+
+    data = pd.DataFrame.from_dict(all_records)
+    if data.empty:
+        raise ValueError("Climate Engine yanıtındaki zaman serisi boş.")
+    date_column = next(
+        (column for column in data.columns if column.lower() in {"date", "tarih", "time"}),
+        None,
+    )
+    if date_column:
+        data = data.rename(columns={date_column: "Tarih"})
+        data["Tarih"] = pd.to_datetime(data["Tarih"], errors="coerce")
+    else:
+        raise ValueError("Climate Engine yanıtında tarih alanı bulunamadı.")
+
+    identifier_columns = {
+        "Tarih", "Date", "date", "time", "Time", "system:index",
+        "latitude", "longitude", "lat", "lon", "name", "id",
+    }
+    for column in data.columns:
+        if column not in identifier_columns:
+            converted = pd.to_numeric(data[column], errors="coerce")
+            if converted.notna().any():
+                data[column] = converted
+
+    centroid = wgs84.dissolve().geometry.iloc[0].centroid
+    data.insert(1, "Örnek ID", 1)
+    data.insert(2, "Enlem", float(centroid.y))
+    data.insert(3, "Boylam", float(centroid.x))
+    requested_variables = {
+        item.strip().lower() for item in variables.split(",") if item.strip()
+    }
+    rain_candidates = [
+        column
+        for column in data.columns
+        if (
+            "precip" in str(column).lower()
+            or str(column).lower() in {"pr", "ppt", "rain", "rainfall"}
+        )
+        and pd.api.types.is_numeric_dtype(data[column])
+    ]
+    if requested_variables & {"precipitation", "pr", "ppt", "rain", "rainfall"}:
+        if not rain_candidates:
+            value_candidates = [
+                column
+                for column in data.select_dtypes(include="number").columns
+                if column not in {"Örnek ID", "Enlem", "Boylam"}
+            ]
+            if len(value_candidates) == 1:
+                rain_candidates = value_candidates
+        if rain_candidates:
+            data = data.rename(columns={rain_candidates[0]: "Toplam yağış (mm)"})
+    metadata = {
+        "endpoint": endpoint,
+        "dataset": dataset,
+        "variables": variables,
+        "area_reducer": area_reducer,
+        "geometry_type": candidate.geom_type,
+        "geometry_valid": bool(candidate.is_valid),
+        "geometry_bounds_wgs84": [float(value) for value in candidate.bounds],
+        "geometry_coordinate_characters": len(coordinates),
+        "geometry_simplification_m": tolerance,
+        "request_chunks": chunk_metadata,
+    }
+    return data, metadata
+
+
+def fetch_map_tile(
+    api_key: str,
+    gdf: gpd.GeoDataFrame,
+    start_date,
+    end_date,
+    dataset: str,
+    variable: str,
+    analysis: str,
+) -> tuple[str, dict[str, Any]]:
+    """Climate Engine MapID uç noktasından görselleştirme karo adresi alır."""
+    bounds = gdf.to_crs(4326).total_bounds.tolist()
+    if analysis == "SPI":
+        endpoint = f"{BASE_URL}/raster/mapid/standard_index"
+        params = {
+            "dataset": dataset,
+            "variable": "spi",
+            "distribution": "gamma",
+            "start_date": str(start_date),
+            "end_date": str(end_date),
+            "start_year": int(pd.Timestamp(start_date).year),
+            "end_year": int(pd.Timestamp(end_date).year),
+            "bounding_box": str(bounds),
+            "colormap_opacity": 0.85,
+            "colormap_type": "continuous",
+        }
+    else:
+        endpoint = f"{BASE_URL}/raster/mapid/values"
+        params = {
+            "dataset": dataset,
+            "variable": variable,
+            "temporal_statistic": "mean",
+            "start_date": str(start_date),
+            "end_date": str(end_date),
+            "bounding_box": str(bounds),
+            "colormap_opacity": 0.85,
+            "colormap_type": "continuous",
+        }
+    response = requests.get(
+        endpoint,
+        headers={"Authorization": api_key.strip()},
+        params=params,
+        timeout=180,
+    )
+    if not response.ok:
+        try:
+            detail = response.json()
+        except ValueError:
+            detail = response.text.strip()
+        raise RuntimeError(
+            f"Climate Engine haritası üretilemedi (HTTP {response.status_code}): "
+            f"{str(detail)[:1000]}"
+        )
+    body = response.json()
+
+    def find_tile_url(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key == "tile_fetcher" and isinstance(child, str):
+                    return child
+                found = find_tile_url(child)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = find_tile_url(child)
+                if found:
+                    return found
+        return None
+
+    tile_url = find_tile_url(body)
+    if not tile_url:
+        raise ValueError("Climate Engine yanıtında tile_fetcher harita adresi bulunamadı.")
+    return tile_url, {
+        "endpoint": endpoint,
+        "dataset": dataset,
+        "variable": variable,
+        "analysis": analysis,
+        "period": f"{start_date}/{end_date}",
+        "bounds": bounds,
+    }
