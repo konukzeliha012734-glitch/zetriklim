@@ -1,0 +1,9 @@
+[server]
+# Community Cloud GitHub değişikliklerini kendi dağıtım yöneticisiyle uygular.
+# Python'un yerel CBS modüllerini çalışan süreçte yeniden yüklemeye çalışmak
+# modül önbelleği hatalarına ve yerel kütüphane çökmelerine yol açabilir.
+fileWatcherType = "none"
+runOnSave = false
+
+[browser]
+gatherUsageStats = false
