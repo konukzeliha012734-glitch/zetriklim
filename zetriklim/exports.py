@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 def build_metadata(**kwargs) -> bytes:
     payload = {
         "application": "Zetriklim",
-        "application_version": "0.7.1",
+        "application_version": "1.0.0",
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         **kwargs,
         "provenance_note": (
