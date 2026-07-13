@@ -1028,82 +1028,133 @@ with tab_research:
             "baseline_end": 2024,
         }
     else:
+        selected_drought_components = [
+            item for item in selected_analyses if item in {"SPI", "SPEI"}
+        ]
+        selected_response_components = [
+            item for item in selected_analyses if item in {"NDVI", "EVI", "LST"}
+        ]
+        has_drought_analysis = bool(selected_drought_components)
+        has_response_analysis = bool(selected_response_components)
+        research_profile_key = "_".join(selected_analyses) or "academic"
+
+        if has_drought_analysis and has_response_analysis:
+            default_title = "Havza ölçeğinde çok kaynaklı kuraklık ve ekosistem tepkisi analizi"
+            default_question = (
+                "Kuraklığın seçilen ekosistem değişkenleri üzerindeki etkisi hangi zaman "
+                "ölçeğinde ve kaç aylık gecikmeyle ortaya çıkmaktadır?"
+            )
+            default_hypotheses = (
+                "H1: Kuraklık indisleri ile ekosistem tepki değişkenleri arasında anlamlı ilişki vardır.\n"
+                "H2: Ekosistem tepkisi kuraklıktan sonra gecikmeli ortaya çıkar.\n"
+                "H3: Arazi örtüsü sınıfları kuraklık tepkisinin büyüklüğünü değiştirir."
+            )
+        elif has_drought_analysis:
+            default_title = "Havza ölçeğinde kuraklık indisi ve eğilim analizi"
+            default_question = (
+                "Seçilen kuraklık indisleri çalışma döneminde hangi sıklık, şiddet ve "
+                "uzun dönemli eğilim özelliklerini göstermektedir?"
+            )
+            default_hypotheses = (
+                "H1: Çalışma döneminde kuraklık şiddeti veya sıklığında anlamlı değişim vardır.\n"
+                "H2: Kuraklık özellikleri seçilen zaman ölçeklerine göre farklılaşır."
+            )
+        else:
+            response_names = ", ".join(selected_response_components)
+            default_title = f"Havza ölçeğinde {response_names} eğilim ve mekânsal değişim analizi"
+            default_question = (
+                f"{response_names} değerleri çalışma döneminde zamansal eğilim ve arazi "
+                "örtüsü sınıflarına göre mekânsal farklılık göstermekte midir?"
+            )
+            default_hypotheses = (
+                f"H1: {response_names} değerlerinde istatistiksel olarak anlamlı zamansal eğilim vardır.\n"
+                f"H2: {response_names} değerleri arazi örtüsü sınıfları arasında anlamlı biçimde farklılaşır."
+            )
+
         st.markdown('<div class="step">Araştırma sorusu ve hipotezler</div>', unsafe_allow_html=True)
         st.caption("Her alanın yanındaki ? simgesine tıklayarak kısa açıklamasını görebilirsiniz.")
         academic_study["title"] = st.text_input(
             "Çalışma başlığı",
-            value="Havza ölçeğinde çok kaynaklı kuraklık ve bitki örtüsü tepkisi analizi",
+            value=default_title,
             help="Tezde, raporda ve çıktı metadata dosyasında görünecek araştırma başlığıdır.",
+            key=f"academic_title_{research_profile_key}",
         )
         academic_study["question"] = st.text_area(
             "Araştırma sorusu",
-            value=(
-                "Meteorolojik kuraklığın bitki örtüsü ve yüzey sıcaklığı üzerindeki etkisi "
-                "hangi zaman ölçeğinde ve kaç aylık gecikmeyle ortaya çıkmaktadır?"
-            ),
+            value=default_question,
             help="Çalışmanın tek ve ölçülebilir ana sorusudur; hangi değişkenler arasındaki ilişkinin araştırıldığını belirtir.",
+            key=f"academic_question_{research_profile_key}",
         )
         academic_study["hypotheses"] = st.text_area(
             "Hipotezler (her satıra bir hipotez)",
-            value=(
-                "H1: SPEI, sıcak-kurak dönemleri SPI'ye göre daha güçlü belirler.\n"
-                "H2: NDVI/EVI tepkisi kuraklıktan sonra gecikmeli ortaya çıkar.\n"
-                "H3: CHIRPS ve ERA5-Land seçimi sonuçlarda ölçülebilir belirsizlik oluşturur.\n"
-                "H4: LST artışı bitki örtüsü kaybından önce veya eş zamanlı gerçekleşir."
-            ),
+            value=default_hypotheses,
             height=145,
             help="Verilerle sınanacak bilimsel beklentilerdir. Her hipotezi H1, H2 şeklinde ayrı satıra yazın.",
+            key=f"academic_hypotheses_{research_profile_key}",
         )
 
-        st.markdown("##### Kuraklık indisleri ve referans dönemi")
-        r1, r2, r3, r4 = st.columns(4)
-        drought_indices = r1.multiselect(
-            "Kuraklık indisleri",
-            ["SPI", "SPEI"],
-            default=[item for item in selected_analyses if item in {"SPI", "SPEI"}],
-            help="Boş bırakıldığında yalnız seçili NDVI/EVI/LST eğilimleri analiz edilir.",
-        )
-        scales = r2.multiselect(
-            "Zaman ölçeği (ay)", [1, 3, 6, 9, 12, 18, 24], default=[1, 3, 6, 12, 24],
-            help="Kuraklığın kaç aylık birikimli koşullarla hesaplanacağını belirler. Kısa ölçekler hızlı, uzun ölçekler kalıcı etkileri gösterir.",
-        )
-        baseline_start = int(
-            r3.number_input(
+        drought_indices = selected_drought_components
+        scales = [3]
+        baseline_start, baseline_end = 1991, 2020
+        spi_distribution, spei_distribution = "Gamma", "Log-logistic"
+        event_threshold = -1.0
+
+        if has_drought_analysis:
+            st.markdown("##### Kuraklık indisleri ve referans dönemi")
+            st.info(
+                "Analiz Seçimi bölümünden otomatik aktarıldı: "
+                + " + ".join(drought_indices)
+            )
+            r1, r2, r3 = st.columns(3)
+            scales = r1.multiselect(
+                "Zaman ölçeği (ay)", [1, 3, 6, 9, 12, 18, 24], default=[1, 3, 6, 12, 24],
+                help="Kuraklığın kaç aylık birikimli koşullarla hesaplanacağını belirler. Kısa ölçekler hızlı, uzun ölçekler kalıcı etkileri gösterir.",
+            )
+            baseline_start = int(r2.number_input(
                 "Referans başlangıcı", 1981, date.today().year - 9, 1991,
                 help="SPI/SPEI değerlerinin normal koşullara göre standartlaştırılacağı klimatolojik dönemin ilk yılıdır.",
-            )
-        )
-        baseline_end = int(
-            r4.number_input(
+            ))
+            baseline_end = int(r3.number_input(
                 "Referans bitişi", baseline_start + 9, date.today().year, 2020,
                 help="Klimatolojik referans döneminin son yılıdır. Güvenilir sonuç için tercihen en az 30 yıllık dönem seçilir.",
-            )
-        )
-        if baseline_end - baseline_start + 1 < 30:
-            st.warning(
-                "Kararlı standartlaştırma için en az 30 yıllık referans dönemi önerilir."
-            )
-        d1, d2, d3 = st.columns(3)
-        spi_distribution = d1.selectbox(
-            "SPI dağılımı", ["Gamma", "Pearson Tip III"],
-            help="Yağış olasılıklarının SPI değerine dönüştürülmesinde kullanılacak istatistiksel dağılımdır; Gamma yaygın varsayılandır.",
-        )
-        spei_distribution = d2.selectbox(
-            "SPEI dağılımı", ["Log-logistic", "Pearson Tip III"],
-            help="Yağış eksi potansiyel evapotranspirasyon su dengesinin standartlaştırılmasında kullanılacak dağılımdır.",
-        )
-        event_threshold = d3.selectbox(
-            "Kuraklık olayı eşiği", [-0.5, -1.0, -1.5, -2.0], index=1,
-            help="İndis bu değerin altına düştüğünde dönem kuraklık olayı sayılır. −1,0 orta; −1,5 şiddetli; −2,0 olağanüstü kuraklığı temsil eder.",
-        )
-        st.caption(
-            "SPEI su dengesi, GEE iş akışında ERA5-Land model potansiyel buharlaşmasıyla "
-            "hesaplanır; bu değişken FAO-56 referans evapotranspirasyonu (ET₀) ile aynı değildir. "
-            "Kullanılan ürün ve dönüşüm adımları raporun yöntem/metadata bölümüne yazılır."
-        )
+            ))
+            if baseline_end - baseline_start + 1 < 30:
+                st.warning("Kararlı standartlaştırma için en az 30 yıllık referans dönemi önerilir.")
 
-        st.markdown("##### Eğilim, gecikmeli tepki ve mekânsal tabakalama")
-        a1, a2, a3, a4 = st.columns(4)
+            distribution_columns = st.columns(len(drought_indices) + 1)
+            distribution_position = 0
+            if "SPI" in drought_indices:
+                spi_distribution = distribution_columns[distribution_position].selectbox(
+                    "SPI dağılımı", ["Gamma", "Pearson Tip III"],
+                    help="Yağış olasılıklarının SPI değerine dönüştürülmesinde kullanılacak istatistiksel dağılımdır; Gamma yaygın varsayılandır.",
+                )
+                distribution_position += 1
+            if "SPEI" in drought_indices:
+                spei_distribution = distribution_columns[distribution_position].selectbox(
+                    "SPEI dağılımı", ["Log-logistic", "Pearson Tip III"],
+                    help="Yağış eksi potansiyel evapotranspirasyon su dengesinin standartlaştırılmasında kullanılacak dağılımdır.",
+                )
+                distribution_position += 1
+            event_threshold = distribution_columns[distribution_position].selectbox(
+                "Kuraklık olayı eşiği", [-0.5, -1.0, -1.5, -2.0], index=1,
+                help="İndis bu değerin altına düştüğünde dönem kuraklık olayı sayılır. −1,0 orta; −1,5 şiddetli; −2,0 olağanüstü kuraklığı temsil eder.",
+            )
+            if "SPEI" in drought_indices:
+                st.caption(
+                    "SPEI su dengesi, GEE iş akışında ERA5-Land model potansiyel buharlaşmasıyla "
+                    "hesaplanır; bu değişken FAO-56 referans evapotranspirasyonu (ET₀) ile aynı değildir. "
+                    "Kullanılan ürün ve dönüşüm adımları raporun yöntem/metadata bölümüne yazılır."
+                )
+        else:
+            st.info(
+                "Yalnız " + " + ".join(selected_response_components)
+                + " seçildiği için SPI/SPEI, kuraklık eşiği ve referans dönemi ayarları uygulanmaz."
+            )
+
+        st.markdown("##### Eğilim ve mekânsal tabakalama")
+        trend_column_count = 4 if has_drought_analysis and has_response_analysis else 3
+        trend_columns = st.columns(trend_column_count)
+        a1, a2, a3 = trend_columns[:3]
         prewhiten = a1.checkbox(
             "Otokorelasyon düzeltmesi", value=True,
             help="Ardışık ayların birbirine benzemesinden kaynaklanabilecek yapay eğilim anlamlılığını azaltır.",
@@ -1116,38 +1167,43 @@ with tab_research:
             "Anlamlılık düzeyi", [0.01, 0.05, 0.10], index=1,
             help="İstatistiksel karar sınırıdır. 0,05 seçimi, yanlış pozitif sonuç için %5 kabul edilen hata olasılığı anlamına gelir.",
         ))
-        max_lag = int(a4.slider(
-            "Azami gecikme (ay)", 0, 12, 6,
-            help="Kuraklık ile bitki örtüsü veya yüzey sıcaklığı tepkisi arasında aranacak en uzun gecikmedir.",
-        ))
-        b1, b2 = st.columns(2)
-        response_indices = b1.multiselect(
-            "Ekosistem tepki değişkenleri",
-            ["NDVI", "EVI", "LST"],
-            default=[item for item in selected_analyses if item in {"NDVI", "EVI", "LST"}],
-            help="Kuraklığın etkisini ölçmek için kullanılacak uydu tabanlı sonuç değişkenleridir: NDVI/EVI bitki örtüsünü, LST yüzey sıcaklığını gösterir.",
-        )
-        correlation_method = b2.selectbox(
-            "İlişki yöntemi", ["Spearman", "Pearson"],
-            help="Spearman doğrusal olmayan sıralı ilişkiler için daha dayanıklıdır; Pearson doğrusal ilişkiyi ölçer.",
-        )
-        land_cover_labels = st.multiselect(
-            "Arazi örtüsüne göre ayrı analiz",
-            list(LAND_COVER_CLASSES.values()),
-            default=["Ağaç örtüsü", "Otlak/mera", "Tarım alanı"],
-            help="ESA WorldCover 2021 sınıflarıyla NDVI/EVI/LST zonal ortalamaları oluşturulur.",
-        )
+        max_lag, correlation_method = 0, "Spearman"
+        if has_drought_analysis and has_response_analysis:
+            max_lag = int(trend_columns[3].slider(
+                "Azami gecikme (ay)", 0, 12, 6,
+                help="Kuraklık ile bitki örtüsü veya yüzey sıcaklığı tepkisi arasında aranacak en uzun gecikmedir.",
+            ))
+            correlation_method = st.selectbox(
+                "Kuraklık–ekosistem ilişki yöntemi", ["Spearman", "Pearson"],
+                help="Spearman doğrusal olmayan sıralı ilişkiler için daha dayanıklıdır; Pearson doğrusal ilişkiyi ölçer.",
+            )
+
+        response_indices = selected_response_components
+        land_cover_labels: list[str] = []
+        if has_response_analysis:
+            st.info(
+                "Ekosistem değişkenleri Analiz Seçimi bölümünden otomatik aktarıldı: "
+                + " + ".join(response_indices)
+            )
+            land_cover_labels = st.multiselect(
+                "Arazi örtüsüne göre ayrı analiz",
+                list(LAND_COVER_CLASSES.values()),
+                default=["Ağaç örtüsü", "Otlak/mera", "Tarım alanı"],
+                help="ESA WorldCover 2021 sınıflarıyla NDVI/EVI/LST zonal ortalamaları oluşturulur.",
+            )
         land_cover_codes = [
             code for code, label in LAND_COVER_CLASSES.items() if label in land_cover_labels
         ]
 
-        st.markdown("##### İstasyonla bağımsız doğrulama (isteğe bağlı)")
-        station_upload = st.file_uploader(
-            "Aylık/günlük istasyon yağış tablosu",
-            type=["csv", "xlsx", "xls"],
-            help="Tarih ve yağış sütunu içeren bir tablo yüklenirse aylık toplam alınarak doğrulamaya eklenir.",
-        )
-        if station_upload is not None:
+        station_upload = None
+        if has_drought_analysis:
+            st.markdown("##### İstasyonla bağımsız doğrulama (isteğe bağlı)")
+            station_upload = st.file_uploader(
+                "Aylık/günlük istasyon yağış tablosu",
+                type=["csv", "xlsx", "xls"],
+                help="Tarih ve yağış sütunu içeren bir tablo yüklenirse aylık toplam alınarak doğrulamaya eklenir.",
+            )
+        if has_drought_analysis and station_upload is not None:
             try:
                 station_raw = (
                     pd.read_excel(station_upload)
@@ -1184,7 +1240,7 @@ with tab_research:
             except Exception as station_error:
                 st.session_state.pop("academic_station_data", None)
                 st.error(f"İstasyon tablosu okunamadı: {station_error}")
-        elif st.button("Yüklü istasyon serisini temizle"):
+        elif has_drought_analysis and st.button("Yüklü istasyon serisini temizle"):
             st.session_state.pop("academic_station_data", None)
             st.rerun()
 
@@ -1446,7 +1502,7 @@ with tab_output:
                     spi_table = None
                     academic_results: dict[str, pd.DataFrame] = {}
                     station_data = st.session_state.get("academic_station_data")
-                    if academic_mode and isinstance(station_data, pd.DataFrame):
+                    if academic_mode and drought_indices and isinstance(station_data, pd.DataFrame):
                         climate_data["Tarih"] = pd.to_datetime(
                             climate_data["Tarih"], errors="coerce"
                         )
