@@ -14,7 +14,13 @@ from branca.colormap import LinearColormap, StepColormap
 from folium import plugins
 from streamlit_folium import st_folium
 
-from zetriklim.catalog import ANALYSES, ANALYSIS_METHODS, SOURCES, VARIABLES
+from zetriklim.catalog import (
+    ANALYSES,
+    ANALYSIS_METHODS,
+    SOURCES,
+    VARIABLES,
+    academic_data_package,
+)
 from zetriklim.academic import (
     build_academic_report_html,
     run_academic_analysis,
@@ -483,8 +489,19 @@ with tab_area:
             fmap = folium.Map([39.0, 35.0], zoom_start=5, tiles="CartoDB positron")
         st_folium(fmap, height=570, width="stretch", returned_objects=[])
 
+academic_components_for_source = st.session_state.get(
+    "academic_analysis_components",
+    ["SPI", "SPEI", "NDVI", "EVI", "LST"],
+)
+automatic_academic_package = academic_data_package(academic_components_for_source)
 analysis_for_source = (
-    "SPI" if academic_mode else st.session_state.get("selected_analysis_widget", "SPI")
+    (
+        "SPI"
+        if automatic_academic_package["components"][0] == "SPEI"
+        else automatic_academic_package["components"][0]
+    )
+    if academic_mode
+    else st.session_state.get("selected_analysis_widget", "SPI")
 )
 source_context_label = "Akademik çoklu analiz" if academic_mode else analysis_for_source
 
@@ -759,13 +776,15 @@ with tab_data:
                 use_container_width=True,
             )
         elif academic_mode:
-            product = st.selectbox(
-                "Akademik veri paketi",
-                ["CHIRPS + ERA5-Land + Sentinel-2 + Landsat + ESA WorldCover"],
-                help="Seçilen SPI, SPEI, NDVI, EVI ve LST bileşenlerine göre gerekli koleksiyonlar birlikte çağrılır.",
+            product = str(automatic_academic_package["label"])
+            st.markdown("**Otomatik akademik veri paketi**")
+            st.info(product, icon="📦")
+            st.caption(
+                "02 · Analiz Seçimi bölümündeki tercihinize göre gerekli veri "
+                "koleksiyonları otomatik atanmıştır; ayrıca ürün seçmeniz gerekmez."
             )
             ce_dataset_id, ce_variable_ids = "", ""
-            product_start_date = date(1981, 1, 1)
+            product_start_date = automatic_academic_package["start_date"]
         else:
             product = st.selectbox(
                 "Veri ürünü",
@@ -780,13 +799,7 @@ with tab_data:
                 "LST": date(2013, 4, 11),
             }[analysis_for_source]
         variables = (
-            [
-                "Yağış",
-                "Hava sıcaklığı",
-                "Potansiyel evapotranspirasyon",
-                "NDVI / EVI",
-                "Yüzey sıcaklığı (LST)",
-            ]
+            list(automatic_academic_package["variables"])
             if academic_mode
             else {
                 "SPI": ["Yağış"],
@@ -878,8 +891,10 @@ with tab_data:
             f"{product} kullanılabilir dönem başlangıcı: {product_start_date:%d.%m.%Y}. "
             "Bu tarihten önceki bir dönem için daha eski arşive sahip başka bir ürün seçilmelidir."
         )
-        temporal_scale = "Aylık" if analysis_for_source == "SPI" else "Dönem kompoziti"
-        aggregation = "Toplam" if analysis_for_source == "SPI" else "Medyan"
+        temporal_scale = "Aylık" if academic_mode or analysis_for_source == "SPI" else "Dönem kompoziti"
+        aggregation = "Değişkene uygun aylık özet" if academic_mode else (
+            "Toplam" if analysis_for_source == "SPI" else "Medyan"
+        )
         start_time, end_time = None, None
         st.info(
             f"Zamansal işlem otomatik belirlendi: {temporal_scale} · {aggregation}.",
@@ -1014,9 +1029,11 @@ with tab_research:
         }
     else:
         st.markdown('<div class="step">Araştırma sorusu ve hipotezler</div>', unsafe_allow_html=True)
+        st.caption("Her alanın yanındaki ? simgesine tıklayarak kısa açıklamasını görebilirsiniz.")
         academic_study["title"] = st.text_input(
             "Çalışma başlığı",
             value="Havza ölçeğinde çok kaynaklı kuraklık ve bitki örtüsü tepkisi analizi",
+            help="Tezde, raporda ve çıktı metadata dosyasında görünecek araştırma başlığıdır.",
         )
         academic_study["question"] = st.text_area(
             "Araştırma sorusu",
@@ -1024,6 +1041,7 @@ with tab_research:
                 "Meteorolojik kuraklığın bitki örtüsü ve yüzey sıcaklığı üzerindeki etkisi "
                 "hangi zaman ölçeğinde ve kaç aylık gecikmeyle ortaya çıkmaktadır?"
             ),
+            help="Çalışmanın tek ve ölçülebilir ana sorusudur; hangi değişkenler arasındaki ilişkinin araştırıldığını belirtir.",
         )
         academic_study["hypotheses"] = st.text_area(
             "Hipotezler (her satıra bir hipotez)",
@@ -1034,6 +1052,7 @@ with tab_research:
                 "H4: LST artışı bitki örtüsü kaybından önce veya eş zamanlı gerçekleşir."
             ),
             height=145,
+            help="Verilerle sınanacak bilimsel beklentilerdir. Her hipotezi H1, H2 şeklinde ayrı satıra yazın.",
         )
 
         st.markdown("##### Kuraklık indisleri ve referans dönemi")
@@ -1045,23 +1064,37 @@ with tab_research:
             help="Boş bırakıldığında yalnız seçili NDVI/EVI/LST eğilimleri analiz edilir.",
         )
         scales = r2.multiselect(
-            "Zaman ölçeği (ay)", [1, 3, 6, 9, 12, 18, 24], default=[1, 3, 6, 12, 24]
+            "Zaman ölçeği (ay)", [1, 3, 6, 9, 12, 18, 24], default=[1, 3, 6, 12, 24],
+            help="Kuraklığın kaç aylık birikimli koşullarla hesaplanacağını belirler. Kısa ölçekler hızlı, uzun ölçekler kalıcı etkileri gösterir.",
         )
         baseline_start = int(
-            r3.number_input("Referans başlangıcı", 1981, date.today().year - 9, 1991)
+            r3.number_input(
+                "Referans başlangıcı", 1981, date.today().year - 9, 1991,
+                help="SPI/SPEI değerlerinin normal koşullara göre standartlaştırılacağı klimatolojik dönemin ilk yılıdır.",
+            )
         )
         baseline_end = int(
-            r4.number_input("Referans bitişi", baseline_start + 9, date.today().year, 2020)
+            r4.number_input(
+                "Referans bitişi", baseline_start + 9, date.today().year, 2020,
+                help="Klimatolojik referans döneminin son yılıdır. Güvenilir sonuç için tercihen en az 30 yıllık dönem seçilir.",
+            )
         )
         if baseline_end - baseline_start + 1 < 30:
             st.warning(
                 "Kararlı standartlaştırma için en az 30 yıllık referans dönemi önerilir."
             )
         d1, d2, d3 = st.columns(3)
-        spi_distribution = d1.selectbox("SPI dağılımı", ["Gamma", "Pearson Tip III"])
-        spei_distribution = d2.selectbox("SPEI dağılımı", ["Log-logistic", "Pearson Tip III"])
+        spi_distribution = d1.selectbox(
+            "SPI dağılımı", ["Gamma", "Pearson Tip III"],
+            help="Yağış olasılıklarının SPI değerine dönüştürülmesinde kullanılacak istatistiksel dağılımdır; Gamma yaygın varsayılandır.",
+        )
+        spei_distribution = d2.selectbox(
+            "SPEI dağılımı", ["Log-logistic", "Pearson Tip III"],
+            help="Yağış eksi potansiyel evapotranspirasyon su dengesinin standartlaştırılmasında kullanılacak dağılımdır.",
+        )
         event_threshold = d3.selectbox(
-            "Kuraklık olayı eşiği", [-0.5, -1.0, -1.5, -2.0], index=1
+            "Kuraklık olayı eşiği", [-0.5, -1.0, -1.5, -2.0], index=1,
+            help="İndis bu değerin altına düştüğünde dönem kuraklık olayı sayılır. −1,0 orta; −1,5 şiddetli; −2,0 olağanüstü kuraklığı temsil eder.",
         )
         st.caption(
             "SPEI su dengesi, GEE iş akışında ERA5-Land model potansiyel buharlaşmasıyla "
@@ -1071,17 +1104,33 @@ with tab_research:
 
         st.markdown("##### Eğilim, gecikmeli tepki ve mekânsal tabakalama")
         a1, a2, a3, a4 = st.columns(4)
-        prewhiten = a1.checkbox("Otokorelasyon düzeltmesi", value=True)
-        seasonal_mk = a2.checkbox("Mevsimsel Mann–Kendall", value=True)
-        alpha = float(a3.selectbox("Anlamlılık düzeyi", [0.01, 0.05, 0.10], index=1))
-        max_lag = int(a4.slider("Azami gecikme (ay)", 0, 12, 6))
+        prewhiten = a1.checkbox(
+            "Otokorelasyon düzeltmesi", value=True,
+            help="Ardışık ayların birbirine benzemesinden kaynaklanabilecek yapay eğilim anlamlılığını azaltır.",
+        )
+        seasonal_mk = a2.checkbox(
+            "Mevsimsel Mann–Kendall", value=True,
+            help="İlkbahar-yaz gibi doğal mevsim farklarını dikkate alarak uzun dönemli artış veya azalış eğilimini sınar.",
+        )
+        alpha = float(a3.selectbox(
+            "Anlamlılık düzeyi", [0.01, 0.05, 0.10], index=1,
+            help="İstatistiksel karar sınırıdır. 0,05 seçimi, yanlış pozitif sonuç için %5 kabul edilen hata olasılığı anlamına gelir.",
+        ))
+        max_lag = int(a4.slider(
+            "Azami gecikme (ay)", 0, 12, 6,
+            help="Kuraklık ile bitki örtüsü veya yüzey sıcaklığı tepkisi arasında aranacak en uzun gecikmedir.",
+        ))
         b1, b2 = st.columns(2)
         response_indices = b1.multiselect(
             "Ekosistem tepki değişkenleri",
             ["NDVI", "EVI", "LST"],
             default=[item for item in selected_analyses if item in {"NDVI", "EVI", "LST"}],
+            help="Kuraklığın etkisini ölçmek için kullanılacak uydu tabanlı sonuç değişkenleridir: NDVI/EVI bitki örtüsünü, LST yüzey sıcaklığını gösterir.",
         )
-        correlation_method = b2.selectbox("İlişki yöntemi", ["Spearman", "Pearson"])
+        correlation_method = b2.selectbox(
+            "İlişki yöntemi", ["Spearman", "Pearson"],
+            help="Spearman doğrusal olmayan sıralı ilişkiler için daha dayanıklıdır; Pearson doğrusal ilişkiyi ölçer.",
+        )
         land_cover_labels = st.multiselect(
             "Arazi örtüsüne göre ayrı analiz",
             list(LAND_COVER_CLASSES.values()),
@@ -1106,14 +1155,20 @@ with tab_research:
                     else pd.read_csv(station_upload, sep=None, engine="python")
                 )
                 s1, s2 = st.columns(2)
-                station_date_column = s1.selectbox("İstasyon tarih sütunu", list(station_raw.columns))
+                station_date_column = s1.selectbox(
+                    "İstasyon tarih sütunu", list(station_raw.columns),
+                    help="Gözlemin gününü veya ayını içeren sütunu seçin; değerler aylık toplam için tarihe göre gruplanır.",
+                )
                 station_numeric = [
                     column
                     for column in station_raw.columns
                     if pd.to_numeric(station_raw[column], errors="coerce").notna().any()
                     and column != station_date_column
                 ]
-                station_value_column = s2.selectbox("İstasyon yağış sütunu", station_numeric)
+                station_value_column = s2.selectbox(
+                    "İstasyon yağış sütunu", station_numeric,
+                    help="Milimetre cinsinden günlük veya aylık yağış miktarını içeren sayısal sütunu seçin.",
+                )
                 station_dates = pd.to_datetime(station_raw[station_date_column], errors="coerce")
                 station_values = pd.to_numeric(station_raw[station_value_column], errors="coerce")
                 station_monthly = (
