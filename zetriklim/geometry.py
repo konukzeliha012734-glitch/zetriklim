@@ -12,11 +12,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-import geopandas as gpd
-import shapefile
-from shapely.geometry import shape as shapely_shape
-
-
 REQUIRED_SHAPE_PARTS = {".shp", ".shx", ".dbf"}
 SUPPORTED_SUFFIXES = {".zip", ".shp", ".shx", ".dbf", ".prj", ".cpg", ".gpkg", ".geojson", ".json"}
 
@@ -48,6 +43,8 @@ class GeometrySummary:
 
     @property
     def centroid(self) -> tuple[float, float]:
+        import geopandas as gpd
+
         geom = self.gdf_wgs84[["geometry"]].dissolve().to_crs(self.area_crs).geometry.iloc[0]
         point = gpd.GeoSeries([geom.centroid], crs=self.area_crs).to_crs(4326).iloc[0]
         return point.y, point.x
@@ -99,6 +96,10 @@ def _count_vertices(geometry) -> int:
 
 
 def _read_single_shp(content: bytes, fallback_crs: str) -> gpd.GeoDataFrame:
+    import geopandas as gpd
+    import shapefile
+    from shapely.geometry import shape as shapely_shape
+
     try:
         reader = shapefile.Reader(shp=io.BytesIO(content))
         geometries = [
@@ -143,6 +144,8 @@ def _read_dataset_isolated(
         detail = (completed.stderr or completed.stdout or "bilinmeyen GDAL hatası").strip()
         raise GeometryUploadError(f"Coğrafi dosya güvenli işlemde okunamadı: {detail}")
     payload = json.loads(result_path.read_text(encoding="utf-8"))
+    import geopandas as gpd
+
     gdf = gpd.GeoDataFrame.from_features(payload["geojson"]["features"], crs=4326)
     return gdf, str(payload["source_crs"])
 

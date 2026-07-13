@@ -7,7 +7,6 @@ import json
 from datetime import timedelta
 from typing import Any
 
-import geopandas as gpd
 import pandas as pd
 import requests
 

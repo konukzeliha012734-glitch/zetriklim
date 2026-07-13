@@ -9,7 +9,6 @@ from __future__ import annotations
 import re
 from typing import Any
 
-import geopandas as gpd
 import requests
 
 
@@ -36,6 +35,8 @@ def fetch_gadm_boundaries(
     timeout: int = 30,
 ) -> tuple[gpd.GeoDataFrame, dict[str, Any]]:
     """Bir ülkenin GADM sınırlarını indirir ve kaynak metadata kaydıyla döndürür."""
+    import geopandas as gpd
+
     url = gadm_download_url(country_iso3, level)
     response = requests.get(
         url,

@@ -13,7 +13,6 @@ from datetime import date
 from pathlib import Path
 
 import ee
-import geopandas as gpd
 import numpy as np
 import pandas as pd
 import requests
@@ -222,6 +221,8 @@ def _ee_geometry(gdf: gpd.GeoDataFrame) -> ee.Geometry:
 
 
 def _centroid_latlon(gdf: gpd.GeoDataFrame) -> tuple[float, float]:
+    import geopandas as gpd
+
     wgs84 = gdf.to_crs(4326)
     metric_crs = wgs84.estimate_utm_crs() or "EPSG:6933"
     centroid_metric = wgs84[["geometry"]].dissolve().to_crs(metric_crs).geometry.iloc[0].centroid

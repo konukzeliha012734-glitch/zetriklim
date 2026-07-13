@@ -11,7 +11,6 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-import geopandas as gpd
 import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_agg import FigureCanvasAgg
