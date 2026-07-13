@@ -25,6 +25,7 @@ bir uygulamadır. Sabit yüzölçümü sınırı yoktur.
 
 ## Akademik Araştırma modu
 
+- SPI zorunluluğu olmadan SPI, SPEI, NDVI, EVI ve LST bileşenlerini bağımsız veya birlikte seçme
 - SPI ve SPEI için 1/3/6/9/12/18/24 aylık ölçekler ve kullanıcı tanımlı referans dönemi
 - Gamma, Pearson Tip III ve log-logistic dağılım seçenekleri; KS uyum testi ve AIC
 - Kuraklık başlangıcı, bitişi, süresi, şiddeti ve yoğunluğunu içeren olay kataloğu
@@ -36,6 +37,10 @@ bir uygulamadır. Sabit yüzölçümü sınırı yoktur.
 - Kaynaklar arası ensemble yayılımı ve belirsizlik serisi
 - Eksik ay, yinelenen tarih, fiziksel aralık ve uydu geçerli piksel kalite kontrolleri
 - Excel/CSV tabloları, CBS katmanları, izlenebilir metadata ve bağımsız HTML bilimsel rapor
+- Kaynak değişkenleriyle hesaplanan indisleri aynı aylık tabloda birleştiren doğrulanmış analiz CSV'si
+- Türkçe Excel için noktalı virgül ayırıcılı ve ondalık virgüllü ek CSV
+- Ölçek, kuzey oku, koordinat ağı, lejant, projeksiyon ve kaynak bilgili tez haritası
+- GADM 4.1 sınırlarını lisansa uygun biçimde yalnız kartografik bağlam olarak kullanma
 
 ## Çalıştırma
 

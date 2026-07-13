@@ -631,7 +631,7 @@ def quality_control_table(
 def run_academic_analysis(
     data: pd.DataFrame,
     *,
-    precipitation_column: str,
+    precipitation_column: str | None,
     pet_column: str | None,
     response_columns: Iterable[str],
     validation_columns: Iterable[str],
@@ -642,57 +642,81 @@ def run_academic_analysis(
     baseline_start = int(config.get("baseline_start", 1991))
     baseline_end = int(config.get("baseline_end", 2020))
     drought_indices = list(config.get("drought_indices", ["SPI", "SPEI"]))
+    response_columns = list(response_columns)
+    validation_columns = list(validation_columns)
     results: dict[str, pd.DataFrame] = {}
+    warnings: list[dict[str, str]] = []
 
-    drought = pd.DataFrame({"Tarih": pd.to_datetime(data[date_column], errors="coerce")})
+    dates = pd.to_datetime(data[date_column], errors="coerce")
+    dates = dates.dt.to_period("M").dt.to_timestamp()
+    drought = pd.DataFrame({"Tarih": dates})
     drought = drought.dropna().drop_duplicates("Tarih").sort_values("Tarih")
     diagnostics = []
     if "SPI" in drought_indices:
-        spi = calculate_spi_academic(
-            data,
-            precipitation_column,
-            scales,
-            baseline_start=baseline_start,
-            baseline_end=baseline_end,
-            distribution=str(config.get("spi_distribution", "Gamma")),
-            date_column=date_column,
-        )
-        drought = drought.merge(spi, on="Tarih", how="outer")
-        diagnostics.append(
-            distribution_diagnostics(
-                _monthly_series(data, precipitation_column, date_column),
-                scales=scales,
+        if precipitation_column and precipitation_column in data:
+            spi = calculate_spi_academic(
+                data,
+                precipitation_column,
+                scales,
+                baseline_start=baseline_start,
+                baseline_end=baseline_end,
                 distribution=str(config.get("spi_distribution", "Gamma")),
+                date_column=date_column,
+            )
+            drought = drought.merge(spi, on="Tarih", how="outer")
+            diagnostics.append(
+                distribution_diagnostics(
+                    _monthly_series(data, precipitation_column, date_column),
+                    scales=scales,
+                    distribution=str(config.get("spi_distribution", "Gamma")),
+                    baseline_start=baseline_start,
+                    baseline_end=baseline_end,
+                    index_name="SPI",
+                )
+            )
+        else:
+            warnings.append({"Bileşen": "SPI", "Durum": "Yağış sütunu bulunamadığı için hesaplanmadı."})
+    if "SPEI" in drought_indices:
+        if precipitation_column and precipitation_column in data and pet_column and pet_column in data:
+            spei = calculate_spei_table(
+                data,
+                precipitation_column,
+                pet_column,
+                scales,
                 baseline_start=baseline_start,
                 baseline_end=baseline_end,
-                index_name="SPI",
-            )
-        )
-    if "SPEI" in drought_indices and pet_column and pet_column in data:
-        spei = calculate_spei_table(
-            data,
-            precipitation_column,
-            pet_column,
-            scales,
-            baseline_start=baseline_start,
-            baseline_end=baseline_end,
-            distribution=str(config.get("spei_distribution", "Log-logistic")),
-            date_column=date_column,
-        )
-        drought = drought.merge(spei, on="Tarih", how="outer")
-        water_balance = _monthly_series(data, precipitation_column, date_column) - _monthly_series(data, pet_column, date_column)
-        diagnostics.append(
-            distribution_diagnostics(
-                water_balance,
-                scales=scales,
                 distribution=str(config.get("spei_distribution", "Log-logistic")),
-                baseline_start=baseline_start,
-                baseline_end=baseline_end,
-                index_name="SPEI",
+                date_column=date_column,
             )
-        )
+            drought = drought.merge(spei, on="Tarih", how="outer")
+            water_balance = _monthly_series(data, precipitation_column, date_column) - _monthly_series(data, pet_column, date_column)
+            diagnostics.append(
+                distribution_diagnostics(
+                    water_balance,
+                    scales=scales,
+                    distribution=str(config.get("spei_distribution", "Log-logistic")),
+                    baseline_start=baseline_start,
+                    baseline_end=baseline_end,
+                    index_name="SPEI",
+                )
+            )
+        else:
+            warnings.append({"Bileşen": "SPEI", "Durum": "Yağış veya PET sütunu bulunamadığı için hesaplanmadı."})
+    available_responses = list(response_columns)
+    for requested in config.get("response_indices", []):
+        if not any(
+            column == requested or column.startswith(f"{requested}|")
+            for column in available_responses
+        ):
+            warnings.append(
+                {
+                    "Bileşen": str(requested),
+                    "Durum": "Seçilen veri kaynağında geçerli aylık seri bulunamadığı için hesaplanmadı.",
+                }
+            )
     results["Kuraklık Serisi"] = drought.sort_values("Tarih")
     results["Dağılım Uyum"] = pd.concat(diagnostics, ignore_index=True) if diagnostics else pd.DataFrame()
+    results["Analiz Uyarıları"] = pd.DataFrame(warnings)
 
     index_columns = [
         column
@@ -715,6 +739,7 @@ def run_academic_analysis(
 
     merged = data.copy()
     merged[date_column] = pd.to_datetime(merged[date_column], errors="coerce")
+    merged[date_column] = merged[date_column].dt.to_period("M").dt.to_timestamp()
     merged = merged.merge(drought[["Tarih", *index_columns]], left_on=date_column, right_on="Tarih", how="outer")
     if date_column != "Tarih":
         merged = merged.drop(columns=["Tarih_y"], errors="ignore").rename(columns={"Tarih_x": date_column})
@@ -737,14 +762,19 @@ def run_academic_analysis(
         remove_seasonality=bool(config.get("remove_seasonality", True)),
         alpha=float(config.get("alpha", 0.05)),
     )
-    results["Kaynak Doğrulama"] = compare_sources(data, precipitation_column, validation_columns)
-    source_columns = [precipitation_column, *[column for column in validation_columns if column in data]]
-    results["Belirsizlik"] = uncertainty_table(data, source_columns, date_column=date_column)
+    if precipitation_column and precipitation_column in data:
+        results["Kaynak Doğrulama"] = compare_sources(data, precipitation_column, validation_columns)
+        source_columns = [precipitation_column, *[column for column in validation_columns if column in data]]
+        results["Belirsizlik"] = uncertainty_table(data, source_columns, date_column=date_column)
+    else:
+        results["Kaynak Doğrulama"] = pd.DataFrame()
+        results["Belirsizlik"] = pd.DataFrame()
 
     ranges: dict[str, tuple[float | None, float | None]] = {
-        precipitation_column: (0, None),
-        **{column: (0, None) for column in validation_columns if column in data},
+        column: (0, None) for column in validation_columns if column in data
     }
+    if precipitation_column and precipitation_column in data:
+        ranges[precipitation_column] = (0, None)
     if pet_column:
         ranges[pet_column] = (0, None)
     for column in response_columns:
@@ -758,7 +788,59 @@ def run_academic_analysis(
         elif "sahne sayısı" in column.lower():
             ranges[column] = (0, None)
     results["Kalite Kontrol"] = quality_control_table(data, date_column=date_column, expected_ranges=ranges)
+    results["Birleşik Analiz Serisi"] = prepare_academic_series_export(
+        data,
+        results["Kuraklık Serisi"],
+        date_column=date_column,
+    )
     return results
+
+
+def prepare_academic_series_export(
+    source_data: pd.DataFrame,
+    drought_series: pd.DataFrame | None,
+    *,
+    date_column: str = "Tarih",
+) -> pd.DataFrame:
+    """Kaynak değişkenleri ile hesaplanan indisleri tek, yinelenmeyen aylık seride birleştirir."""
+    if date_column not in source_data:
+        raise ValueError(f"Tarih sütunu bulunamadı: {date_column}")
+    monthly = source_data.copy()
+    monthly[date_column] = pd.to_datetime(monthly[date_column], errors="coerce")
+    monthly = monthly.dropna(subset=[date_column])
+    monthly[date_column] = monthly[date_column].dt.to_period("M").dt.to_timestamp()
+
+    aggregations: dict[str, str] = {}
+    for column in monthly.columns:
+        if column == date_column:
+            continue
+        numeric = pd.to_numeric(monthly[column], errors="coerce")
+        if numeric.notna().any():
+            monthly[column] = numeric
+            aggregations[column] = "mean"
+        else:
+            aggregations[column] = "first"
+    monthly = monthly.groupby(date_column, as_index=False).agg(aggregations).sort_values(date_column)
+
+    if drought_series is not None and not drought_series.empty:
+        calculated = drought_series.copy()
+        calculated["Tarih"] = pd.to_datetime(calculated["Tarih"], errors="coerce")
+        calculated = calculated.dropna(subset=["Tarih"])
+        calculated["Tarih"] = calculated["Tarih"].dt.to_period("M").dt.to_timestamp()
+        calculated = calculated.drop_duplicates("Tarih", keep="last").sort_values("Tarih")
+        overlap = [column for column in calculated.columns if column in monthly.columns and column != "Tarih"]
+        monthly = monthly.drop(columns=overlap, errors="ignore")
+        monthly = monthly.merge(calculated, left_on=date_column, right_on="Tarih", how="outer")
+        if date_column != "Tarih":
+            monthly = monthly.drop(columns=[date_column], errors="ignore")
+    elif date_column != "Tarih":
+        monthly = monthly.rename(columns={date_column: "Tarih"})
+
+    monthly["Tarih"] = pd.to_datetime(monthly["Tarih"], errors="coerce")
+    monthly = monthly.dropna(subset=["Tarih"]).drop_duplicates("Tarih").sort_values("Tarih")
+    monthly.insert(1, "Yıl", monthly["Tarih"].dt.year)
+    monthly.insert(2, "Ay", monthly["Tarih"].dt.month)
+    return monthly.reset_index(drop=True)
 
 
 def build_academic_report_html(
@@ -783,12 +865,26 @@ def build_academic_report_html(
             f"<p>Toplam {len(table):,} kayıt; raporda ilk {len(preview):,} kayıt gösterilmektedir.</p>"
             f"{preview.to_html(index=False, border=0, classes='dataframe', na_rep='—')}</section>"
         )
+    index_methods = []
+    drought_indices = list(config.get("drought_indices", []))
+    if "SPI" in drought_indices:
+        index_methods.append(
+            f"SPI: {escape(str(config.get('spi_distribution', 'Gamma')))} dağılımı ve sıfır olasılığı düzeltmesi"
+        )
+    if "SPEI" in drought_indices:
+        index_methods.append(
+            f"SPEI: {escape(str(config.get('spei_distribution', 'Log-logistic')))} dağılımı"
+        )
+    response_indices = list(config.get("response_indices", []))
+    if response_indices:
+        index_methods.append(
+            "Ekosistem/yüzey değişkenleri: " + escape(", ".join(map(str, response_indices)))
+        )
     methodology = (
-        f"SPI: {escape(str(config.get('spi_distribution', 'Gamma')))} dağılımı ve sıfır olasılığı düzeltmesi; "
-        f"SPEI: {escape(str(config.get('spei_distribution', 'Log-logistic')))} dağılımı; "
-        f"referans dönemi {config.get('baseline_start', 1991)}–{config.get('baseline_end', 2020)}; "
-        f"ölçekler {escape(', '.join(map(str, config.get('scales', []))))} ay. "
-        "Eğilimler Mann–Kendall, trend-free prewhitening, Sen eğimi ve Pettitt testiyle; "
+        ("; ".join(index_methods) + ". " if index_methods else "")
+        + f"Referans dönemi {config.get('baseline_start', 1991)}–{config.get('baseline_end', 2020)}; "
+        f"ölçekler {escape(', '.join(map(str, config.get('scales', [])))) or 'uygulanmadı'} ay. "
+        "Seçili bütün değişkenlerin eğilimleri Mann–Kendall, trend-free prewhitening, Sen eğimi ve Pettitt testiyle; "
         "çoklu karşılaştırmalar Benjamini–Hochberg FDR düzeltmesiyle değerlendirilmiştir."
     )
     html = f"""<!doctype html>
