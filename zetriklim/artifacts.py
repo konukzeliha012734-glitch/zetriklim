@@ -190,60 +190,6 @@ def build_raster_png(
     fixed_range: tuple[float, float] | None = (-2.5, 2.5),
     source_note: str | None = None,
 ) -> bytes:
-    with MemoryFile(geotiff) as memory:
-        with memory.open() as src:
-            raster = src.read(1, masked=True).astype(float).filled(float("nan"))
-            extent = plotting_extent(src)
-            raster_crs = src.crs
-    fig = Figure(figsize=(10, 8), dpi=180, facecolor="#fbfaf6")
-    ax = fig.add_subplot(111)
-    if fixed_range is not None:
-        range_args = {"vmin": fixed_range[0], "vmax": fixed_range[1]}
-    else:
-        finite = raster[np.isfinite(raster)]
-        if finite.size:
-            lower, upper = np.nanpercentile(finite, [2, 98])
-            range_args = {"vmin": float(lower), "vmax": float(upper)} if upper > lower else {}
-        else:
-            range_args = {}
-    image = ax.imshow(raster, cmap=palette, extent=extent, origin="upper", **range_args)
-    if boundary is not None and raster_crs is not None:
-        boundary.to_crs(raster_crs).boundary.plot(
-            ax=ax,
-            color="#082f49",
-            linewidth=1.4,
-            zorder=3,
-        )
-    ax.set_title(title, color="#153b46", fontsize=14, weight="bold", pad=14)
-    _configure_map_axes(ax, raster_crs)
-    _draw_north_arrow(ax)
-    latitude = float(boundary.to_crs(4326).geometry.union_all().centroid.y) if boundary is not None else 0.0
-    _draw_scale_bar(ax, raster_crs, latitude=latitude)
-    colorbar = fig.colorbar(image, ax=ax, shrink=0.76, pad=0.025)
-    colorbar.set_label(colorbar_label)
-    fig.text(
-        0.01,
-        0.015,
-        f"Kaynak: {source_note or 'Zetriklim analiz çıktısı'} · Koordinat sistemi: {raster_crs or 'tanımsız'}",
-        fontsize=7.5,
-        color="#526970",
-    )
-    fig.subplots_adjust(left=0.10, right=0.93, top=0.90, bottom=0.11)
-    output = io.BytesIO()
-    FigureCanvasAgg(fig).print_png(output)
-    return output.getvalue()
-
-
-def build_raster_png(
-    geotiff: bytes,
-    title: str,
-    *,
-    boundary: gpd.GeoDataFrame | None = None,
-    palette: str = "RdBu",
-    colorbar_label: str = "SPI",
-    fixed_range: tuple[float, float] | None = (-2.5, 2.5),
-    source_note: str | None = None,
-) -> bytes:
     with tempfile.TemporaryDirectory(prefix="zetriklim_raster_png_") as temp:
         folder = Path(temp)
         input_path = folder / "input.tif"
