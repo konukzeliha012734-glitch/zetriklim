@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import io
 import math
+import json
+import subprocess
+import sys
 import tempfile
 import zipfile
 from pathlib import Path
@@ -335,19 +338,33 @@ def build_area_map_png(
 
 def geodata_to_gpkg(gdf: gpd.GeoDataFrame, point: tuple[float, float]) -> bytes:
     with tempfile.TemporaryDirectory(prefix="zetriklim_gpkg_") as temp:
-        path = Path(temp) / "zetriklim-cbs.gpkg"
-        gdf.to_file(path, layer="calisma_alani", driver="GPKG")
-        point_gdf = gpd.GeoDataFrame(
-            {
-                "ornek_id": [1],
-                "aciklama": ["İklim verisi örnekleme noktası"],
-                "csv_baglanti_alani": ["Örnek ID"],
-            },
-            geometry=gpd.points_from_xy([point[1]], [point[0]]),
-            crs=4326,
+        folder = Path(temp)
+        input_path = folder / "calisma-alani.json"
+        output_path = folder / "zetriklim-cbs.gpkg"
+        input_path.write_text(
+            json.dumps(json.loads(gdf.to_crs(4326).to_json(drop_id=True)), ensure_ascii=False),
+            encoding="utf-8",
         )
-        point_gdf.to_file(path, layer="ornekleme_noktasi", driver="GPKG")
-        return path.read_bytes()
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "zetriklim.geodata_worker",
+                "write-gpkg",
+                str(input_path),
+                str(output_path),
+                str(float(point[0])),
+                str(float(point[1])),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=90,
+            check=False,
+        )
+        if completed.returncode != 0 or not output_path.exists():
+            detail = (completed.stderr or completed.stdout or "bilinmeyen GDAL hatası").strip()
+            raise RuntimeError(f"GeoPackage güvenli işlemde üretilemedi: {detail}")
+        return output_path.read_bytes()
 
 
 def build_complete_package(files: dict[str, bytes]) -> bytes:

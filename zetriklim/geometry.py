@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import io
+import json
+import subprocess
+import sys
 import tempfile
 import zipfile
 from dataclasses import dataclass
@@ -114,6 +117,31 @@ def _read_single_shp(content: bytes, fallback_crs: str) -> gpd.GeoDataFrame:
     )
 
 
+def _read_dataset_isolated(dataset: Path) -> tuple[gpd.GeoDataFrame, str]:
+    """Pyogrio/GDAL okumasını Rasterio yüklü ana süreçten ayrı çalıştırır."""
+    result_path = dataset.parent / "zetriklim-okunan-geometri.json"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "zetriklim.geodata_worker",
+            "read",
+            str(dataset),
+            str(result_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+    if completed.returncode != 0 or not result_path.exists():
+        detail = (completed.stderr or completed.stdout or "bilinmeyen GDAL hatası").strip()
+        raise GeometryUploadError(f"Coğrafi dosya güvenli işlemde okunamadı: {detail}")
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    gdf = gpd.GeoDataFrame.from_features(payload["geojson"]["features"], crs=4326)
+    return gdf, str(payload["source_crs"])
+
+
 def inspect_uploaded_files(
     files: Iterable[UploadedPart],
     fallback_crs: str = "EPSG:4326",
@@ -138,12 +166,13 @@ def inspect_uploaded_files(
         non_zip_parts = [
             part for part in parts if Path(part.name).suffix.lower() not in {".zip"}
         ]
+        source_crs_override = None
         if len(shp_parts) == 1 and len(non_zip_parts) == 1:
             gdf = _read_single_shp(shp_parts[0].content, fallback_crs)
         else:
             dataset = _find_dataset(folder)
             try:
-                gdf = gpd.read_file(dataset)
+                gdf, source_crs_override = _read_dataset_isolated(dataset)
             except Exception as exc:
                 raise GeometryUploadError(f"Coğrafi dosya okunamadı: {exc}") from exc
 
@@ -158,7 +187,7 @@ def inspect_uploaded_files(
         if repaired:
             gdf.geometry = gdf.geometry.make_valid()
 
-        source_crs = gdf.crs.to_string()
+        source_crs = source_crs_override or gdf.crs.to_string()
         gdf_wgs84 = gdf.to_crs(4326)
         area_crs_obj = gdf_wgs84.estimate_utm_crs() or "EPSG:6933"
         dissolved = gdf_wgs84[["geometry"]].dissolve().to_crs(area_crs_obj)

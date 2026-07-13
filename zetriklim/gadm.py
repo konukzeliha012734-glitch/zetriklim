@@ -6,7 +6,6 @@ böylece GADM'nin akademik kullanım ve yeniden dağıtım koşulları korunur.
 
 from __future__ import annotations
 
-import io
 import re
 from typing import Any
 
@@ -44,7 +43,8 @@ def fetch_gadm_boundaries(
         headers={"User-Agent": "Zetriklim/1.1 academic-cartography"},
     )
     response.raise_for_status()
-    boundaries = gpd.read_file(io.BytesIO(response.content))
+    payload = response.json()
+    boundaries = gpd.GeoDataFrame.from_features(payload.get("features", []), crs=4326)
     if boundaries.empty:
         raise ValueError("GADM yanıtı geçerli idari sınır içermiyor.")
     if boundaries.crs is None:

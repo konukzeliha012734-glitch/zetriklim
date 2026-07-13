@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import unittest
+import sqlite3
+import tempfile
+from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
@@ -11,9 +14,15 @@ from rasterio.transform import from_bounds
 from shapely.geometry import box
 
 from zetriklim.academic import prepare_academic_series_export, run_academic_analysis
-from zetriklim.artifacts import build_area_map_png, build_raster_png, dataframe_to_csv
+from zetriklim.artifacts import (
+    build_area_map_png,
+    build_raster_png,
+    dataframe_to_csv,
+    geodata_to_gpkg,
+)
 from zetriklim.catalog import academic_data_package
 from zetriklim.gadm import gadm_download_url
+from zetriklim.geometry import UploadedPart, inspect_uploaded_files
 
 
 class CartographyAndExportTests(unittest.TestCase):
@@ -64,6 +73,25 @@ class CartographyAndExportTests(unittest.TestCase):
         )
         self.assertTrue(result.startswith(b"\x89PNG"))
         self.assertGreater(len(result), 50_000)
+
+    def test_geopackage_is_built_in_isolated_worker(self) -> None:
+        result = geodata_to_gpkg(self.area, (38.25, 35.3))
+        self.assertTrue(result.startswith(b"SQLite format 3\x00"))
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "result.gpkg"
+            path.write_bytes(result)
+            connection = sqlite3.connect(path)
+            try:
+                layers = {
+                    row[0]
+                    for row in connection.execute("SELECT table_name FROM gpkg_contents")
+                }
+            finally:
+                connection.close()
+        self.assertEqual(layers, {"calisma_alani", "ornekleme_noktasi"})
+        summary = inspect_uploaded_files([UploadedPart("area.gpkg", result)])
+        self.assertEqual(summary.feature_count, 1)
+        self.assertGreater(summary.area_km2, 1_000)
 
     def test_csv_variants_and_combined_series(self) -> None:
         source = pd.DataFrame(
