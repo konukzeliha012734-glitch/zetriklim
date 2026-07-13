@@ -66,23 +66,36 @@ def fetch_timeseries(
     metric_crs = wgs84.estimate_utm_crs() or "EPSG:6933"
     metric_geometry = wgs84[["geometry"]].dissolve().to_crs(metric_crs)
     tolerance = 100
-    simplified = metric_geometry.simplify(tolerance, preserve_topology=True)
-    candidate = simplified.to_crs(4326).iloc[0]
-    coordinates = json.dumps(candidate.__geo_interface__["coordinates"])
-    while len(coordinates) > 80_000 and tolerance < 10_000:
-        tolerance *= 2
+
+    def geometry_coordinates(simplify_tolerance: int) -> str:
         candidate = (
-            metric_geometry.simplify(tolerance, preserve_topology=True)
+            metric_geometry.simplify(simplify_tolerance, preserve_topology=True)
             .to_crs(4326)
             .iloc[0]
         )
-        coordinates = json.dumps(candidate.__geo_interface__["coordinates"])
+        if candidate.is_empty or not candidate.is_valid:
+            candidate = metric_geometry.to_crs(4326).iloc[0]
+        return json.dumps(candidate.__geo_interface__["coordinates"])
+
+    coordinates = geometry_coordinates(tolerance)
+    # Büyük poligonlar POST sınırına sığsa bile Earth Engine tarafında işlem hatasına
+    # yol açabiliyor. Günlük seriler için daha güvenli, fakat şekli koruyan bir hedef.
+    while len(coordinates) > 8_000 and tolerance < 10_000:
+        tolerance *= 2
+        coordinates = geometry_coordinates(tolerance)
     endpoint = f"{BASE_URL}/timeseries/native/coordinates"
     headers = {"Authorization": api_key.strip()}
 
-    def request_period(period_start, period_end) -> tuple[list[dict], dict[str, Any]]:
+    def request_period(
+        period_start,
+        period_end,
+        request_tolerance: int = tolerance,
+        allow_geometry_retry: bool = True,
+    ) -> tuple[list[dict], dict[str, Any]]:
+        request_coordinates = geometry_coordinates(request_tolerance)
         payload = {
-            "coordinates": coordinates,
+            "coordinates": request_coordinates,
+            "simplify_geometry": request_tolerance,
             "area_reducer": area_reducer,
             "dataset": dataset.strip(),
             "variable": variables.strip(),
@@ -101,25 +114,59 @@ def fetch_timeseries(
                 error_detail = response.text.strip()
             error_text = str(error_detail)
             span_days = (period_end - period_start).days
-            if (
-                response.status_code >= 500
-                and "Response size exceeds limit" in error_text
-                and span_days > 31
-            ):
+            server_error = response.status_code >= 500
+            response_too_large = "Response size exceeds limit" in error_text
+
+            # İlk 500 yanıtında geometriyi daha güçlü sadeleştirerek aynı dönemi
+            # bir kez daha dener. Böylece geçerli fakat karmaşık havza sınırları
+            # kullanıcı müdahalesi olmadan Climate Engine'e uyarlanır.
+            if server_error and allow_geometry_retry and request_tolerance < 10_000:
+                stronger_tolerance = min(max(request_tolerance * 4, 500), 10_000)
+                stronger_coordinates = geometry_coordinates(stronger_tolerance)
+                if len(stronger_coordinates) < len(request_coordinates):
+                    records, retry_meta = request_period(
+                        period_start,
+                        period_end,
+                        stronger_tolerance,
+                        False,
+                    )
+                    return records, {
+                        "geometry_retry": True,
+                        "initial_tolerance_m": request_tolerance,
+                        "retry_tolerance_m": stronger_tolerance,
+                        "result": retry_meta,
+                    }
+
+            # Climate Engine bazı iç sunucu hatalarında ayrıntılı neden dönmüyor.
+            # Günlük veriyi daha küçük dönemlere ayırmak hem yanıt boyutunu hem de
+            # tek Earth Engine görevinin hesap yükünü azaltır.
+            if server_error and span_days > (31 if response_too_large else 62):
                 midpoint = period_start + timedelta(days=span_days // 2)
-                left_records, left_meta = request_period(period_start, midpoint)
+                left_records, left_meta = request_period(
+                    period_start,
+                    midpoint,
+                    request_tolerance,
+                    False,
+                )
                 right_records, right_meta = request_period(
-                    midpoint + timedelta(days=1), period_end
+                    midpoint + timedelta(days=1),
+                    period_end,
+                    request_tolerance,
+                    False,
                 )
                 return left_records + right_records, {
                     "split": True,
+                    "split_reason": (
+                        "response_size" if response_too_large else "server_error"
+                    ),
                     "parts": [left_meta, right_meta],
                 }
             raise RuntimeError(
                 f"Climate Engine isteği başarısız (HTTP {response.status_code}). "
                 f"Dataset={dataset}, değişken={variables}, dönem={period_start}/{period_end}, "
-                f"geometri={len(coordinates):,} karakter, sadeleştirme={tolerance} m. "
-                f"Servis yanıtı: {error_text[:1200]}"
+                f"geometri={len(request_coordinates):,} karakter, "
+                f"sadeleştirme={request_tolerance} m. Servis yanıtı: {error_text[:1200]}. "
+                "Daha sonra yeniden deneyin veya Google Earth Engine kaynağını seçin."
             )
         body = response.json()
         series_groups = body.get("Data")
@@ -134,7 +181,9 @@ def fetch_timeseries(
         else:
             normalized_records = list(records or [])
         return normalized_records, {
-            key: value for key, value in body.items() if key != "Data"
+            **{key: value for key, value in body.items() if key != "Data"},
+            "geometry_characters": len(request_coordinates),
+            "simplify_geometry_m": request_tolerance,
         }
 
     requested_start = pd.Timestamp(start_date).date()
