@@ -23,6 +23,20 @@ bir uygulamadır. Sabit yüzölçümü sınırı yoktur.
 - Kaynak, yöntem ve işlem metadata kaydı
 - Her raster için formül, ürün, dönem, sahne sayısı ve dışa aktarma çözünürlüğü
 
+## Akademik Araştırma modu
+
+- SPI ve SPEI için 1/3/6/9/12/18/24 aylık ölçekler ve kullanıcı tanımlı referans dönemi
+- Gamma, Pearson Tip III ve log-logistic dağılım seçenekleri; KS uyum testi ve AIC
+- Kuraklık başlangıcı, bitişi, süresi, şiddeti ve yoğunluğunu içeren olay kataloğu
+- Mann–Kendall, mevsimsel Mann–Kendall, trend-free prewhitening, Sen eğimi ve Pettitt testi
+- Benjamini–Hochberg çoklu karşılaştırma / FDR düzeltmesi
+- SPI/SPEI ile NDVI, EVI ve LST arasında 0–12 aylık gecikmeli ilişki analizi
+- ESA WorldCover sınıflarına göre orman, mera ve tarım alanı zonal karşılaştırmaları
+- CHIRPS, ERA5-Land ve isteğe bağlı istasyon verisiyle Bias, MAE, RMSE, korelasyon ve KGE
+- Kaynaklar arası ensemble yayılımı ve belirsizlik serisi
+- Eksik ay, yinelenen tarih, fiziksel aralık ve uydu geçerli piksel kalite kontrolleri
+- Excel/CSV tabloları, CBS katmanları, izlenebilir metadata ve bağımsız HTML bilimsel rapor
+
 ## Çalıştırma
 
 Windows'ta önce `Kurulum-Windows.bat`, ardından `Zetriklim-Baslat.bat`
@@ -32,7 +46,7 @@ PowerShell ile:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
-streamlit run app.py
+streamlit run streamlit_app.py
 ```
 
 Uygulama varsayılan olarak `http://localhost:8501` adresinde açılır.
@@ -47,7 +61,7 @@ olarak tanımlayın:
 
 ```powershell
 $env:CLIMATE_ENGINE_API_KEY="anahtarınız"
-streamlit run app.py
+streamlit run streamlit_app.py
 ```
 
 Climate Engine kataloğu kaynak seçeneği olarak korunur; anahtar bulunmadığında veri

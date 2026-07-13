@@ -27,6 +27,17 @@ from zetriklim.spi import calculate_spi_pixel_stack
 CHIRPS_DAILY = "UCSB-CHG/CHIRPS/DAILY"
 CHIRPS_SCALE_M = 5566
 
+LAND_COVER_CLASSES = {
+    10: "Ağaç örtüsü",
+    20: "Çalılık",
+    30: "Otlak/mera",
+    40: "Tarım alanı",
+    50: "Yapılaşmış alan",
+    60: "Çıplak/seyrek bitkili alan",
+    80: "Su",
+    90: "Sulak alan",
+}
+
 REMOTE_ANALYSIS_SPECS = {
     "NDVI": {
         "source": "COPERNICUS/S2_SR_HARMONIZED",
@@ -567,6 +578,263 @@ def fetch_gee_monthly_climate(
             row["Ortalama sıcaklık (°C)"] = properties["temp_c"]
         rows.append(row)
     return pd.DataFrame(rows), unsupported
+
+
+def _empty_named_image(names: list[str]) -> ee.Image:
+    return ee.Image.constant([0.0] * len(names)).rename(names).updateMask(ee.Image.constant(0))
+
+
+def fetch_gee_academic_series(
+    gdf: gpd.GeoDataFrame,
+    start_date: date,
+    end_date: date,
+    *,
+    response_indices: list[str] | None = None,
+    land_cover_codes: list[int] | None = None,
+    project: str | None = None,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Çok kaynaklı aylık kuraklık ve uydu serilerini havza ortalaması olarak getirir.
+
+    Yağış hem CHIRPS hem ERA5-Land'den alınır. SPEI için ERA5-Land potansiyel
+    buharlaşması, ekosistem tepkisi için Sentinel-2 NDVI/EVI ve Landsat LST
+    kullanılır. Seçilen arazi örtüsü sınıfları ESA WorldCover ile zonlanır.
+    """
+    ok, message = initialize_gee(project)
+    if not ok:
+        raise RuntimeError("Earth Engine doğrulanmadı: " + message)
+
+    requested = {
+        item.upper() for item in (response_indices or ["NDVI", "EVI", "LST"])
+        if item.upper() in {"NDVI", "EVI", "LST"}
+    }
+    selected_land_cover = [
+        int(code) for code in (land_cover_codes or []) if int(code) in LAND_COVER_CLASSES
+    ]
+    geometry = _ee_geometry(gdf)
+    centroid_lat, centroid_lon = _centroid_latlon(gdf)
+    chirps = ee.ImageCollection(CHIRPS_DAILY)
+    era5_land = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR")
+    worldcover = ee.Image(ee.ImageCollection("ESA/WorldCover/v200").first()).select("Map")
+    features = []
+
+    for month in _month_starts(start_date, end_date):
+        following = month + relativedelta(months=1)
+        start = month.isoformat()
+        end = following.isoformat()
+        chirps_month = (
+            chirps.filterDate(start, end).sum().rename("CHIRPS yağış (mm)")
+        )
+        era_month = era5_land.filterDate(start, end)
+        era_precip = (
+            era_month.select("total_precipitation_sum")
+            .sum()
+            .multiply(1000)
+            .max(0)
+            .rename("ERA5-Land yağış (mm)")
+        )
+        temperature = (
+            era_month.select("temperature_2m")
+            .mean()
+            .subtract(273.15)
+            .rename("ERA5-Land sıcaklık (°C)")
+        )
+        # ECMWF akı işaret konvansiyonunda buharlaşma yukarı yönlü olduğu için negatiftir.
+        pet = (
+            era_month.select("potential_evaporation_sum")
+            .sum()
+            .multiply(-1000)
+            .max(0)
+            .rename("ERA5-Land PET (mm)")
+        )
+        climate = ee.Image.cat(chirps_month, era_precip, temperature, pet)
+        properties = climate.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=geometry,
+            scale=CHIRPS_SCALE_M,
+            bestEffort=True,
+            maxPixels=1e9,
+        )
+
+        if requested.intersection({"NDVI", "EVI"}) and month >= date(2015, 6, 23):
+            sentinel = (
+                ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+                .filterBounds(geometry)
+                .filterDate(start, end)
+                .filter(ee.Filter.lte("CLOUDY_PIXEL_PERCENTAGE", 60))
+                .map(_mask_sentinel2)
+            )
+            sentinel_count = sentinel.size()
+            sentinel_composite = ee.Image(
+                ee.Algorithms.If(
+                    sentinel_count.gt(0),
+                    sentinel.median(),
+                    _empty_named_image(["B2", "B3", "B4", "B8", "B11"]),
+                )
+            )
+            sentinel_images = []
+            if "NDVI" in requested:
+                sentinel_images.append(
+                    sentinel_composite.normalizedDifference(["B8", "B4"]).rename("NDVI")
+                )
+            if "EVI" in requested:
+                sentinel_images.append(
+                    sentinel_composite.expression(
+                        "2.5 * (nir - red) / (nir + 6 * red - 7.5 * blue + 1)",
+                        {
+                            "nir": sentinel_composite.select("B8"),
+                            "red": sentinel_composite.select("B4"),
+                            "blue": sentinel_composite.select("B2"),
+                        },
+                    ).rename("EVI")
+                )
+            sentinel_indices = ee.Image.cat(*sentinel_images)
+            properties = properties.combine(
+                sentinel_indices.reduceRegion(
+                    reducer=ee.Reducer.mean(),
+                    geometry=geometry,
+                    scale=30,
+                    bestEffort=True,
+                    maxPixels=1e9,
+                ),
+                overwrite=True,
+            )
+            first_index = sorted(requested.intersection({"NDVI", "EVI"}))[0]
+            valid_fraction = (
+                sentinel_indices.select(first_index).mask().unmask(0).reduceRegion(
+                    reducer=ee.Reducer.mean(),
+                    geometry=geometry,
+                    scale=30,
+                    bestEffort=True,
+                    maxPixels=1e9,
+                ).get(first_index)
+            )
+            properties = properties.set("Sentinel-2 sahne sayısı", sentinel_count).set(
+                "Sentinel-2 geçerli piksel oranı", valid_fraction
+            )
+            for code in selected_land_cover:
+                label = LAND_COVER_CLASSES[code]
+                for index_name in sorted(requested.intersection({"NDVI", "EVI"})):
+                    zonal_value = (
+                        sentinel_indices.select(index_name)
+                        .updateMask(worldcover.eq(code))
+                        .reduceRegion(
+                            reducer=ee.Reducer.mean(),
+                            geometry=geometry,
+                            scale=100,
+                            bestEffort=True,
+                            maxPixels=1e9,
+                        )
+                        .get(index_name)
+                    )
+                    properties = properties.set(f"{index_name}|{label}", zonal_value)
+
+        if "LST" in requested and month >= date(2013, 3, 18):
+            landsat = (
+                ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+                .merge(ee.ImageCollection("LANDSAT/LC09/C02/T1_L2"))
+                .filterBounds(geometry)
+                .filterDate(start, end)
+                .filter(ee.Filter.eq("PROCESSING_LEVEL", "L2SP"))
+                .filter(ee.Filter.lte("CLOUD_COVER", 60))
+                .map(_mask_landsat_l2)
+            )
+            landsat_count = landsat.size()
+            lst = ee.Image(
+                ee.Algorithms.If(
+                    landsat_count.gt(0),
+                    landsat.select("ST_B10").median().multiply(0.00341802).add(149).subtract(273.15).rename("LST"),
+                    _empty_named_image(["LST"]),
+                )
+            )
+            properties = properties.combine(
+                lst.reduceRegion(
+                    reducer=ee.Reducer.mean(),
+                    geometry=geometry,
+                    scale=60,
+                    bestEffort=True,
+                    maxPixels=1e9,
+                ),
+                overwrite=True,
+            )
+            lst_valid_fraction = lst.mask().unmask(0).reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=geometry,
+                scale=60,
+                bestEffort=True,
+                maxPixels=1e9,
+            ).get("LST")
+            properties = properties.set("Landsat sahne sayısı", landsat_count).set(
+                "Landsat geçerli piksel oranı", lst_valid_fraction
+            )
+            for code in selected_land_cover:
+                label = LAND_COVER_CLASSES[code]
+                zonal_value = (
+                    lst.updateMask(worldcover.eq(code))
+                    .reduceRegion(
+                        reducer=ee.Reducer.mean(),
+                        geometry=geometry,
+                        scale=100,
+                        bestEffort=True,
+                        maxPixels=1e9,
+                    )
+                    .get("LST")
+                )
+                properties = properties.set(f"LST|{label}", zonal_value)
+
+        properties = (
+            properties.set("date", month.isoformat())
+            .set("sample_id", 1)
+            .set("latitude", centroid_lat)
+            .set("longitude", centroid_lon)
+        )
+        features.append(ee.Feature(None, properties))
+
+    info = ee.FeatureCollection(features).getInfo()
+    rows = []
+    for feature in info.get("features", []):
+        properties = feature.get("properties", {})
+        row = {
+            "Tarih": pd.Timestamp(properties.pop("date")),
+            "Örnek ID": properties.pop("sample_id", 1),
+            "Enlem": properties.pop("latitude", centroid_lat),
+            "Boylam": properties.pop("longitude", centroid_lon),
+        }
+        row.update(properties)
+        rows.append(row)
+    frame = pd.DataFrame(rows).sort_values("Tarih").reset_index(drop=True)
+    metadata = {
+        "datasets": {
+            "CHIRPS": {
+                "id": CHIRPS_DAILY,
+                "catalog_version": "CHIRPS v2.0",
+                "resolution": "0.05 degree / approximately 5.5 km",
+                "variable": "precipitation (mm/day)",
+            },
+            "ERA5-Land": {
+                "id": "ECMWF/ERA5_LAND/DAILY_AGGR",
+                "resolution": "0.1 degree / approximately 11.1 km",
+                "variables": ["total_precipitation_sum", "temperature_2m", "potential_evaporation_sum"],
+            },
+            "Sentinel-2": {
+                "id": "COPERNICUS/S2_SR_HARMONIZED",
+                "processing": "SCL cloud/shadow mask + monthly median",
+            } if requested.intersection({"NDVI", "EVI"}) else None,
+            "Landsat": {
+                "id": "LANDSAT/LC08+C09/C02/T1_L2",
+                "processing": "QA_PIXEL/QA_RADSAT mask + ST_B10 scale/offset",
+            } if "LST" in requested else None,
+            "Arazi örtüsü": {
+                "id": "ESA/WorldCover/v200/2021",
+                "reference_year": 2021,
+            } if selected_land_cover else None,
+        },
+        "spatial_reducer": "Havza/çalışma alanı ortalaması",
+        "temporal_aggregation": "Aylık; yağış ve PET toplam, sıcaklık ve uydu indisleri ortalama/medyan kompozit",
+        "response_indices": sorted(requested),
+        "land_cover_classes": [LAND_COVER_CLASSES[code] for code in selected_land_cover],
+        "pet_sign_conversion": "ERA5-Land potential_evaporation_sum × -1000 (m→mm; ECMWF akı işaret konvansiyonu)",
+    }
+    return frame, metadata
 
 
 def _rolling_month_image(collection: ee.ImageCollection, month: date, scale_months: int) -> ee.Image:
