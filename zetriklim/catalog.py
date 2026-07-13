@@ -104,6 +104,12 @@ ANALYSIS_METHODS = {
         "resolution": "~5,5 km",
         "purpose": "Meteorolojik kuraklığın farklı zaman ölçeklerinde izlenmesi",
     },
+    "SPEI": {
+        "title": "Standartlaştırılmış Yağış-Evapotranspirasyon İndisi",
+        "source": "CHIRPS + ERA5-Land",
+        "resolution": "~5,5–11 km",
+        "purpose": "Yağış ve atmosferik su talebini birlikte kullanarak iklimsel kuraklığın izlenmesi",
+    },
     "NDVI": {
         "title": "Normalize Edilmiş Fark Bitki Örtüsü İndisi",
         "source": "Sentinel-2 L2A",

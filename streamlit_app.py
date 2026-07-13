@@ -36,6 +36,7 @@ from zetriklim.climate_engine import (
     validate_api_key,
 )
 from zetriklim.exports import build_metadata
+from zetriklim.gadm import fetch_gadm_boundaries
 from zetriklim.geometry import GeometryUploadError, UploadedPart, inspect_uploaded_files
 from zetriklim.gee import (
     LAND_COVER_CLASSES,
@@ -78,6 +79,11 @@ if access_code and not st.session_state.get("access_granted"):
 
 def cached_gee_status(project: str | None) -> tuple[bool, str]:
     return initialize_gee(project)
+
+
+@st.cache_data(ttl=86_400, show_spinner=False)
+def cached_gadm_boundaries(country_iso3: str, level: int):
+    return fetch_gadm_boundaries(country_iso3, level)
 
 
 def add_cartographic_controls(
@@ -373,6 +379,41 @@ with tab_area:
         with info_col:
             st.caption("Hatalı dosyayı yükleme kutusundaki × ile tek tek de silebilirsiniz.")
 
+        with st.expander("Tez haritası ayarları", expanded=academic_mode):
+            map_title = st.text_input(
+                "Harita başlığı",
+                value="Çalışma Alanının Konumu",
+                help="PNG alan haritasında kullanılacak şekil başlığıdır.",
+            )
+            map_use_gadm = st.checkbox(
+                "GADM idari sınırlarını bağlam katmanı olarak ekle",
+                value=True,
+                help="GADM verisi yalnız harita çiziminde kullanılır; ham veri pakete eklenmez.",
+            )
+            g1, g2 = st.columns(2)
+            gadm_iso3 = g1.text_input(
+                "GADM ülke kodu (ISO3)",
+                value="TUR",
+                max_chars=3,
+                help="Türkiye için TUR; başka ülkelerde üç harfli ISO3 kodunu girin.",
+            ).strip().upper()
+            gadm_level = int(
+                g2.selectbox(
+                    "İdari düzey",
+                    [0, 1, 2],
+                    index=1,
+                    format_func=lambda value: {
+                        0: "0 · Ülke sınırı",
+                        1: "1 · Birinci düzey (Türkiye: il)",
+                        2: "2 · İkinci düzey (Türkiye: ilçe)",
+                    }[value],
+                )
+            )
+            st.caption(
+                "GADM 4.1 akademik ve ticari olmayan kullanım koşullarıyla kullanılır; "
+                "haritada sürüm ve kaynak bilgisi gösterilir."
+            )
+
         summary = st.session_state.get("geometry_summary")
         if uploads:
             try:
@@ -445,11 +486,12 @@ with tab_area:
 analysis_for_source = (
     "SPI" if academic_mode else st.session_state.get("selected_analysis_widget", "SPI")
 )
+source_context_label = "Akademik çoklu analiz" if academic_mode else analysis_for_source
 
 with tab_data:
     st.markdown('<div class="step">Kaynak, ürün ve değişken</div>', unsafe_allow_html=True)
     st.markdown(
-        f'<div class="hint"><strong>{analysis_for_source}</strong> için yalnızca uyumlu kaynak ve '
+        f'<div class="hint"><strong>{source_context_label}</strong> için yalnızca uyumlu kaynak ve '
         + (
             'ürünler listelenir. Çok kaynaklı akademik analiz için Earth Engine önerilen seçenektir.</div>'
             if academic_mode
@@ -716,6 +758,14 @@ with tab_data:
                 "https://www.climateengine.org/apis/apiDatasets/",
                 use_container_width=True,
             )
+        elif academic_mode:
+            product = st.selectbox(
+                "Akademik veri paketi",
+                ["CHIRPS + ERA5-Land + Sentinel-2 + Landsat + ESA WorldCover"],
+                help="Seçilen SPI, SPEI, NDVI, EVI ve LST bileşenlerine göre gerekli koleksiyonlar birlikte çağrılır.",
+            )
+            ce_dataset_id, ce_variable_ids = "", ""
+            product_start_date = date(1981, 1, 1)
         else:
             product = st.selectbox(
                 "Veri ürünü",
@@ -861,11 +911,24 @@ with tab_analysis:
         unsafe_allow_html=True,
     )
     if academic_mode:
-        selected_analysis = "SPI"
-        st.success(
-            "Bütünleşik kuraklık araştırması seçildi: SPI + SPEI + uydu tepkisi + "
-            "trend + doğrulama + belirsizlik. Ayrıntılar Araştırma Tasarımı sekmesindedir."
+        selected_analyses = st.multiselect(
+            "Akademik analiz bileşenleri",
+            ["SPI", "SPEI", "NDVI", "EVI", "LST"],
+            default=["SPI", "SPEI", "NDVI", "EVI", "LST"],
+            key="academic_analysis_components",
+            help=(
+                "SPI zorunlu değildir. Yalnız SPEI, yalnız NDVI/EVI/LST veya bunların "
+                "istediğiniz birleşimini seçebilirsiniz."
+            ),
         )
+        selected_analysis = selected_analyses[0] if selected_analyses else "SPEI"
+        if selected_analyses:
+            st.success(
+                "Seçilen bağımsız analiz bileşenleri: " + " + ".join(selected_analyses)
+                + ". Eğilim analizi her seçili değişken için ayrı yürütülür."
+            )
+        else:
+            st.error("En az bir akademik analiz bileşeni seçin.")
     else:
         selected_analysis = st.selectbox(
             "Uygulanacak analiz",
@@ -876,20 +939,23 @@ with tab_analysis:
                 "LST arazi yüzey sıcaklığını inceler."
             ),
         )
-    selected_analyses = [selected_analysis]
-    method_info = ANALYSIS_METHODS[selected_analysis]
-    st.dataframe(
-        [{
-            "Yöntem": selected_analysis,
+        selected_analyses = [selected_analysis]
+    method_rows = []
+    for method in selected_analyses:
+        method_info = ANALYSIS_METHODS[method]
+        method_rows.append({
+            "Yöntem": method,
             "Tam ad": method_info["title"],
             "Önerilen ürün": method_info["source"],
             "Doğal çözünürlük": method_info["resolution"],
             "Amaç": method_info["purpose"],
-        }],
+        })
+    st.dataframe(
+        method_rows,
         hide_index=True,
         width="stretch",
     )
-    analysis_params = {"method": selected_analysis}
+    analysis_params = {"method": " + ".join(selected_analyses)}
 
     if selected_analysis == "SPI" and not academic_mode:
         st.markdown("##### SPI hesaplama ayarları")
@@ -973,7 +1039,10 @@ with tab_research:
         st.markdown("##### Kuraklık indisleri ve referans dönemi")
         r1, r2, r3, r4 = st.columns(4)
         drought_indices = r1.multiselect(
-            "İndisler", ["SPI", "SPEI"], default=["SPI", "SPEI"]
+            "Kuraklık indisleri",
+            ["SPI", "SPEI"],
+            default=[item for item in selected_analyses if item in {"SPI", "SPEI"}],
+            help="Boş bırakıldığında yalnız seçili NDVI/EVI/LST eğilimleri analiz edilir.",
         )
         scales = r2.multiselect(
             "Zaman ölçeği (ay)", [1, 3, 6, 9, 12, 18, 24], default=[1, 3, 6, 12, 24]
@@ -1010,7 +1079,7 @@ with tab_research:
         response_indices = b1.multiselect(
             "Ekosistem tepki değişkenleri",
             ["NDVI", "EVI", "LST"],
-            default=["NDVI", "EVI", "LST"],
+            default=[item for item in selected_analyses if item in {"NDVI", "EVI", "LST"}],
         )
         correlation_method = b2.selectbox("İlişki yöntemi", ["Spearman", "Pearson"])
         land_cover_labels = st.multiselect(
@@ -1113,7 +1182,16 @@ with tab_output:
         round(summary.area_km2, 4) if summary else None,
         application_mode,
         json.dumps(
-            {"academic": academic_params, "study": academic_study},
+            {
+                "academic": academic_params,
+                "study": academic_study,
+                "cartography": {
+                    "title": map_title,
+                    "use_gadm": map_use_gadm,
+                    "gadm_iso3": gadm_iso3,
+                    "gadm_level": gadm_level,
+                },
+            },
             ensure_ascii=False,
             sort_keys=True,
             default=str,
@@ -1338,9 +1416,14 @@ with tab_output:
                                 1 if "toplam yağış" in column.lower() else 2
                             )
                         )
-                        if not precipitation_columns:
+                        needs_precipitation = any(
+                            item in {"SPI", "SPEI"}
+                            for item in academic_params.get("drought_indices", [])
+                        )
+                        if needs_precipitation and not precipitation_columns:
                             raise ValueError(
-                                "Akademik analiz için sayısal yağış sütunu bulunamadı."
+                                "Seçilen SPI/SPEI analizi için sayısal yağış sütunu bulunamadı. "
+                                "Yalnız NDVI/EVI/LST seçildiyse kuraklık indislerini boş bırakın."
                             )
                         pet_columns = [
                             column
@@ -1362,7 +1445,7 @@ with tab_output:
                         ]
                         academic_results = run_academic_analysis(
                             climate_data,
-                            precipitation_column=precipitation_columns[0],
+                            precipitation_column=precipitation_columns[0] if precipitation_columns else None,
                             pet_column=pet_columns[0] if pet_columns else None,
                             response_columns=response_columns,
                             validation_columns=validation_columns,
@@ -1375,7 +1458,15 @@ with tab_output:
                                 if table is not None and not table.empty
                             }
                         )
-                        spi_table = academic_results.get("Kuraklık Serisi")
+                        academic_series = academic_results.get("Kuraklık Serisi", pd.DataFrame())
+                        spi_columns = [
+                            column for column in academic_series.columns
+                            if column.startswith("SPI-")
+                        ]
+                        spi_table = (
+                            academic_series[["Tarih", *spi_columns]].copy()
+                            if spi_columns else None
+                        )
                     elif "SPI" in selected_analyses:
                         spi_input_data = climate_data
                         spi_source = climate_model
@@ -1427,6 +1518,23 @@ with tab_output:
                         )
                         spi_table.insert(1, "SPI yağış kaynağı", spi_source)
                         analysis_tables["SPI Sonuçları"] = spi_table
+                    gadm_context = None
+                    gadm_metadata = {}
+                    gadm_error = None
+                    if map_use_gadm:
+                        try:
+                            gadm_context, gadm_metadata = cached_gadm_boundaries(
+                                gadm_iso3,
+                                gadm_level,
+                            )
+                        except Exception as context_error:
+                            gadm_error = str(context_error)
+                    source_request_metadata["cartography"] = {
+                        "title": map_title,
+                        "gadm": gadm_metadata or None,
+                        "gadm_error": gadm_error,
+                    }
+
                     metadata = build_metadata(
                         area={
                             "area_km2": round(summary.area_km2, 6),
@@ -1489,25 +1597,43 @@ with tab_output:
                         ("Merkez enlem", summary.centroid[0]),
                         ("Merkez boylam", summary.centroid[1]),
                     ]
+                    export_data = (
+                        academic_results.get("Birleşik Analiz Serisi", climate_data)
+                        if academic_mode else climate_data
+                    )
                     excel = build_excel(
-                        climate_data,
+                        export_data,
                         metadata_rows=metadata_rows,
                         area_rows=area_rows,
                         analysis_tables=analysis_tables,
                     )
-                    csv_data = dataframe_to_csv(climate_data)
-                    graph_png = build_timeseries_png(climate_data)
-                    map_png = build_area_map_png(summary.gdf_wgs84, summary.centroid)
+                    csv_data = dataframe_to_csv(export_data)
+                    csv_excel_tr = dataframe_to_csv(export_data, excel_tr=True)
+                    graph_png = build_timeseries_png(export_data)
+                    map_png = build_area_map_png(
+                        summary.gdf_wgs84,
+                        summary.centroid,
+                        context=gadm_context,
+                        title=map_title,
+                        subtitle=f"{start_date} – {end_date} · {', '.join(selected_analyses)}",
+                        context_label=f"GADM {gadm_iso3} düzey {gadm_level}",
+                        source_note=(
+                            "Çalışma alanı: kullanıcı verisi · İdari sınırlar: GADM 4.1"
+                            if gadm_context is not None
+                            else "Çalışma alanı: kullanıcı verisi"
+                        ),
+                    )
                     gpkg = geodata_to_gpkg(summary.gdf_wgs84, summary.centroid)
                     readme = (
                         "ZETRİKLİM GERÇEK VERİ VE ANALİZ PAKETİ\n\n"
                         f"Kaynak: {climate_model}\n"
                         f"Dönem: {start_date} – {end_date}\n"
-                        f"Kayıt sayısı: {len(climate_data):,}\n"
+                        f"Kayıt sayısı: {len(export_data):,}\n"
                         f"Örnekleme: {'Havza alan ortalaması' if provider == 'Google Earth Engine' else 'Çalışma alanının merkezindeki ERA5-Land grid hücresi'}.\n\n"
                         "DOSYALAR\n"
                         "- zetriklim-veri.xlsx: veri, kaynak, alan ve özet sayfaları\n"
                         "- zetriklim-veri.csv: CBS ve istatistik yazılımları için tablo\n"
+                        "- zetriklim-veri-excel-tr.csv: Türkçe Excel için noktalı virgüllü tablo\n"
                         "- zetriklim-cbs.gpkg: çalışma alanı ve örnekleme noktası\n"
                         "- calisma-alani.geojson: çalışma alanı sınırı\n"
                         "- zaman-serisi.png: iklim grafiği\n"
@@ -1522,6 +1648,7 @@ with tab_output:
                             "\nAKADEMİK ARAŞTIRMA DOSYALARI\n"
                             "- bilimsel-rapor.html: araştırma sorusu, yöntem, bulgu tabloları ve kaynaklar\n"
                             "- akademik-kuraklik-serisi.csv: SPI ve SPEI zaman serileri\n"
+                            "- akademik-analiz-serisi.csv: kaynak değişkenleri ve seçili indislerin birleşik aylık serisi\n"
                             "- kuraklik-olaylari.csv: olay başlangıcı, bitişi, süre, şiddet ve yoğunluk\n"
                             "- egilim-ve-degisim.csv: Mann–Kendall, Sen eğimi ve Pettitt sonuçları\n"
                             "- gecikmeli-iliski.csv: kuraklık–NDVI/EVI/LST gecikmeli korelasyonları\n"
@@ -1532,6 +1659,7 @@ with tab_output:
                     files = {
                         "zetriklim-veri.xlsx": excel,
                         "zetriklim-veri.csv": csv_data,
+                        "zetriklim-veri-excel-tr.csv": csv_excel_tr,
                         "zetriklim-cbs.gpkg": gpkg,
                         "calisma-alani.geojson": area_geojson,
                         "zaman-serisi.png": graph_png,
@@ -1549,6 +1677,8 @@ with tab_output:
                             "Belirsizlik": "belirsizlik.csv",
                             "Kalite Kontrol": "kalite-kontrol.csv",
                             "Dağılım Uyum": "dagilim-uyum-testleri.csv",
+                            "Birleşik Analiz Serisi": "akademik-analiz-serisi.csv",
+                            "Analiz Uyarıları": "akademik-analiz-uyarilari.csv",
                         }
                         for result_name, file_name in academic_file_names.items():
                             result_table = academic_results.get(result_name)
@@ -1560,6 +1690,17 @@ with tab_output:
                             results=academic_results,
                             source_note=climate_model,
                         )
+                    if gadm_metadata:
+                        files["gadm-harita-kaynagi.json"] = json.dumps(
+                            gadm_metadata,
+                            ensure_ascii=False,
+                            indent=2,
+                        ).encode("utf-8")
+                    if gadm_error:
+                        files["harita-uyarisi.txt"] = (
+                            "GADM bağlam katmanı indirilemedi; çalışma alanı haritası kullanıcı sınırıyla üretildi.\n"
+                            f"Ayrıntı: {gadm_error}"
+                        ).encode("utf-8")
                     remote_errors = []
                     climate_engine_tile_url = None
                     if provider == "Climate Engine":
@@ -1641,9 +1782,10 @@ with tab_output:
                                 precipitation_tif,
                                 f"CHIRPS Toplam Yağış · {start_date} – {end_date}",
                                 boundary=summary.gdf_wgs84,
-                                palette="Blues",
+                                palette="YlGnBu",
                                 colorbar_label="Yağış (mm)",
                                 fixed_range=None,
+                                source_note="CHIRPS Daily",
                             )
                         if "Hava sıcaklığı" in variables:
                             temperature_tif = build_climate_geotiff(
@@ -1659,9 +1801,10 @@ with tab_output:
                                 temperature_tif,
                                 f"ERA5-Land Ortalama Sıcaklık · {start_date} – {end_date}",
                                 boundary=summary.gdf_wgs84,
-                                palette="Spectral_r",
+                                palette="coolwarm",
                                 colorbar_label="Sıcaklık (°C)",
                                 fixed_range=None,
+                                source_note="ERA5-Land",
                             )
                     remote_methods = {
                         "NDVI", "NDWI", "NDMI", "NDBI", "EVI", "SAVI",
@@ -1672,7 +1815,7 @@ with tab_output:
                     ]
                     remote_metadata = []
                     raster_styles = {
-                        "NDVI": ("YlGn", "NDVI", (-1.0, 1.0)),
+                        "NDVI": ("RdYlGn", "NDVI", (-1.0, 1.0)),
                         "NDWI": ("Blues", "NDWI", (-1.0, 1.0)),
                         "NDMI": ("BrBG", "NDMI", (-1.0, 1.0)),
                         "NDBI": ("magma", "NDBI", (-1.0, 1.0)),
@@ -1710,6 +1853,7 @@ with tab_output:
                                 palette=palette,
                                 colorbar_label=colorbar_label,
                                 fixed_range=fixed_range,
+                                source_note=str(method_metadata.get("source", climate_model)),
                             )
                             remote_metadata.append(method_metadata)
                         except Exception as method_error:
@@ -1725,7 +1869,7 @@ with tab_output:
                         files["analiz-uyarilari.txt"] = (
                             "Üretilemeyen analizler\n\n" + "\n".join(remote_errors)
                         ).encode("utf-8")
-                    if spi_table is not None:
+                    if spi_table is not None and "SPI" in selected_analyses:
                         files["spi-sonuclari.csv"] = dataframe_to_csv(spi_table)
                         if provider == "Google Earth Engine" and gee_ok:
                             for selected_scale in (analysis_params.get("scales") or [3]):
@@ -1743,11 +1887,12 @@ with tab_output:
                                     spi_tif,
                                     f"CHIRPS SPI-{selected_scale} · {end_date:%Y-%m}",
                                     boundary=summary.gdf_wgs84,
+                                    source_note="CHIRPS Daily · SPI sınıfları WMO eşikleri",
                                 )
                     st.session_state.output_files = files
                     st.session_state.output_package = build_complete_package(files)
                     st.session_state.output_metadata = metadata
-                    st.session_state.output_data = climate_data
+                    st.session_state.output_data = export_data
                     st.session_state.output_source = climate_model
                     st.session_state.output_analysis_errors = remote_errors
                     st.session_state.output_tile_url = climate_engine_tile_url
@@ -1761,7 +1906,7 @@ with tab_output:
                     )
                 else:
                     st.success(
-                        f"{selected_analysis} analizi tamamlandı: {len(climate_data):,} kayıt. "
+                        f"{' + '.join(selected_analyses)} analizi tamamlandı: {len(export_data):,} aylık kayıt. "
                         "Tablolar, haritalar ve CBS paketi hazır."
                     )
                 if unsupported:
@@ -1789,6 +1934,10 @@ with tab_output:
         academic_output = st.session_state.get("output_academic_results", {})
         if academic_mode and academic_output:
             st.subheader("Akademik bulgular özeti")
+            academic_warnings = academic_output.get("Analiz Uyarıları", pd.DataFrame())
+            if not academic_warnings.empty:
+                st.warning("Bazı seçili bileşenler gerekli değişken bulunamadığı için hesaplanamadı.")
+                st.dataframe(academic_warnings, width="stretch", hide_index=True)
             event_table = academic_output.get("Kuraklık Olayları", pd.DataFrame())
             trend_table = academic_output.get("Eğilim ve Değişim", pd.DataFrame())
             lag_table = academic_output.get("Gecikmeli İlişki", pd.DataFrame())
@@ -1845,7 +1994,7 @@ with tab_output:
             ),
             width="stretch",
         )
-        d1, d2, d3 = st.columns(3)
+        d1, d2, d3, d4 = st.columns(4)
         d1.download_button(
             "Tüm paketi indir (ZIP)",
             st.session_state.output_package,
@@ -1861,11 +2010,19 @@ with tab_output:
             use_container_width=True,
         )
         d3.download_button(
-            "CSV indir",
+            "Standart CSV indir",
             st.session_state.output_files["zetriklim-veri.csv"],
             file_name="zetriklim-veri.csv",
             mime="text/csv",
             use_container_width=True,
+        )
+        d4.download_button(
+            "Türkçe Excel CSV",
+            st.session_state.output_files["zetriklim-veri-excel-tr.csv"],
+            file_name="zetriklim-veri-excel-tr.csv",
+            mime="text/csv",
+            use_container_width=True,
+            help="Noktalı virgül ayırıcı ve ondalık virgül kullanır; Türkçe Excel'de sütunlara doğru ayrılır.",
         )
         cbs1, cbs2, cbs3 = st.columns(3)
         cbs1.download_button(
@@ -1889,6 +2046,12 @@ with tab_output:
             mime="image/png",
             use_container_width=True,
         )
+        with st.expander("Tez formatında çalışma alanı haritasını önizle", expanded=True):
+            st.image(
+                st.session_state.output_files["calisma-alani-haritasi.png"],
+                caption="Ölçek, kuzey oku, koordinat ağı, lejant, projeksiyon ve kaynak bilgisi içeren konum haritası",
+                width="stretch",
+            )
         extra1, extra2 = st.columns(2)
         extra1.download_button(
             "GeoJSON sınırını indir",
