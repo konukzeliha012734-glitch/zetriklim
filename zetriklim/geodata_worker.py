@@ -1,4 +1,4 @@
-"""GDAL tabanlı vektör dosya işlemlerini ana Streamlit sürecinden ayırır."""
+"""Run GDAL vector operations outside the main Streamlit process."""
 
 from __future__ import annotations
 
@@ -9,12 +9,19 @@ from pathlib import Path
 import geopandas as gpd
 
 
-def _read_dataset(input_path: Path, output_path: Path) -> None:
+def _read_dataset(
+    input_path: Path,
+    output_path: Path,
+    fallback_crs: str | None = None,
+) -> None:
     gdf = gpd.read_file(input_path, engine="pyogrio")
     if gdf.empty or gdf.geometry.is_empty.all():
-        raise ValueError("Dosya geçerli bir geometri içermiyor.")
+        raise ValueError("Dosya gecerli bir geometri icermiyor.")
     if gdf.crs is None:
-        raise ValueError("Koordinat sistemi tanımlı değil.")
+        if input_path.suffix.lower() == ".shp" and fallback_crs:
+            gdf = gdf.set_crs(fallback_crs, allow_override=True)
+        else:
+            raise ValueError("Koordinat sistemi tanimli degil.")
     source_crs = gdf.crs.to_string()
     payload = {
         "source_crs": source_crs,
@@ -57,6 +64,7 @@ def main() -> None:
     read_parser = subparsers.add_parser("read")
     read_parser.add_argument("input", type=Path)
     read_parser.add_argument("output", type=Path)
+    read_parser.add_argument("--fallback-crs", default=None)
 
     write_parser = subparsers.add_parser("write-gpkg")
     write_parser.add_argument("input", type=Path)
@@ -66,7 +74,7 @@ def main() -> None:
 
     args = parser.parse_args()
     if args.command == "read":
-        _read_dataset(args.input, args.output)
+        _read_dataset(args.input, args.output, args.fallback_crs)
     else:
         _write_gpkg(args.input, args.output, args.latitude, args.longitude)
 

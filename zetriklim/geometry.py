@@ -117,7 +117,10 @@ def _read_single_shp(content: bytes, fallback_crs: str) -> gpd.GeoDataFrame:
     )
 
 
-def _read_dataset_isolated(dataset: Path) -> tuple[gpd.GeoDataFrame, str]:
+def _read_dataset_isolated(
+    dataset: Path,
+    fallback_crs: str | None = None,
+) -> tuple[gpd.GeoDataFrame, str]:
     """Pyogrio/GDAL okumasını Rasterio yüklü ana süreçten ayrı çalıştırır."""
     result_path = dataset.parent / "zetriklim-okunan-geometri.json"
     completed = subprocess.run(
@@ -128,6 +131,8 @@ def _read_dataset_isolated(dataset: Path) -> tuple[gpd.GeoDataFrame, str]:
             "read",
             str(dataset),
             str(result_path),
+            "--fallback-crs",
+            fallback_crs or "",
         ],
         capture_output=True,
         text=True,
@@ -172,7 +177,10 @@ def inspect_uploaded_files(
         else:
             dataset = _find_dataset(folder)
             try:
-                gdf, source_crs_override = _read_dataset_isolated(dataset)
+                gdf, source_crs_override = _read_dataset_isolated(
+                    dataset,
+                    fallback_crs=fallback_crs,
+                )
             except Exception as exc:
                 raise GeometryUploadError(f"Coğrafi dosya okunamadı: {exc}") from exc
 
