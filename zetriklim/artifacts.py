@@ -14,9 +14,6 @@ from pathlib import Path
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-import rasterio
-from rasterio.io import MemoryFile
-from rasterio.plot import plotting_extent
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
@@ -236,6 +233,59 @@ def build_raster_png(
     output = io.BytesIO()
     FigureCanvasAgg(fig).print_png(output)
     return output.getvalue()
+
+
+def build_raster_png(
+    geotiff: bytes,
+    title: str,
+    *,
+    boundary: gpd.GeoDataFrame | None = None,
+    palette: str = "RdBu",
+    colorbar_label: str = "SPI",
+    fixed_range: tuple[float, float] | None = (-2.5, 2.5),
+    source_note: str | None = None,
+) -> bytes:
+    with tempfile.TemporaryDirectory(prefix="zetriklim_raster_png_") as temp:
+        folder = Path(temp)
+        input_path = folder / "input.tif"
+        output_path = folder / "rendered.png"
+        boundary_path = folder / "boundary.json"
+        input_path.write_bytes(geotiff)
+        command = [
+            sys.executable,
+            "-m",
+            "zetriklim.raster_worker",
+            "render-png",
+            str(input_path),
+            str(output_path),
+            "--title",
+            title,
+            "--palette",
+            palette,
+            "--colorbar-label",
+            colorbar_label,
+        ]
+        if fixed_range is not None:
+            command.extend(["--fixed-range", json.dumps(list(fixed_range))])
+        if source_note:
+            command.extend(["--source-note", source_note])
+        if boundary is not None:
+            boundary_path.write_text(
+                json.dumps(json.loads(boundary.to_crs(4326).to_json(drop_id=True)), ensure_ascii=False),
+                encoding="utf-8",
+            )
+            command.extend(["--boundary", str(boundary_path)])
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        if completed.returncode != 0 or not output_path.exists():
+            detail = (completed.stderr or completed.stdout or "bilinmeyen raster çizim hatası").strip()
+            raise RuntimeError(f"Raster haritası güvenli işlemde üretilemedi: {detail}")
+        return output_path.read_bytes()
 
 
 def build_timeseries_png(data: pd.DataFrame) -> bytes:
