@@ -12,6 +12,7 @@ from shapely.geometry import box
 
 from zetriklim.academic import prepare_academic_series_export, run_academic_analysis
 from zetriklim.artifacts import build_area_map_png, build_raster_png, dataframe_to_csv
+from zetriklim.catalog import academic_data_package
 from zetriklim.gadm import gadm_download_url
 
 
@@ -131,6 +132,18 @@ class CartographyAndExportTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             gadm_download_url("TR", 1)
+
+    def test_academic_package_follows_selected_components(self) -> None:
+        spi = academic_data_package(["SPI"])
+        self.assertEqual(spi["collections"], ["CHIRPS"])
+        self.assertEqual(spi["variables"], ["Yağış"])
+
+        response = academic_data_package(["NDVI", "LST"])
+        self.assertEqual(
+            response["collections"],
+            ["Sentinel-2 SR Harmonized", "Landsat 8/9 Collection 2 L2", "ESA WorldCover"],
+        )
+        self.assertNotIn("CHIRPS", response["label"])
 
 
 if __name__ == "__main__":
