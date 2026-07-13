@@ -92,6 +92,91 @@ def cached_gadm_boundaries(country_iso3: str, level: int):
     return fetch_gadm_boundaries(country_iso3, level)
 
 
+def checkbox_group(
+    label: str,
+    options: list,
+    *,
+    default: list | None = None,
+    key_prefix: str,
+    help: str | None = None,
+    columns: int = 2,
+    ui=st,
+) -> list:
+    ui.markdown(f"**{label}**")
+    if help:
+        ui.caption(help)
+    selected = []
+    default_values = set(default or [])
+    column_count = max(1, min(columns, len(options)))
+    groups = ui.columns(column_count) if column_count > 1 else [ui.container()]
+    for index, option in enumerate(options):
+        group = groups[index % column_count]
+        if group.checkbox(
+            str(option),
+            value=option in default_values,
+            key=f"{key_prefix}_{index}",
+        ):
+            selected.append(option)
+    return selected
+
+
+def _safe_multiselect_key(label: str, key: str | None) -> str:
+    if key:
+        return str(key)
+    cleaned = re.sub(r"\W+", "_", str(label), flags=re.UNICODE).strip("_").lower()
+    return f"safe_multiselect_{cleaned or 'selection'}"
+
+
+def _safe_streamlit_multiselect(
+    label,
+    options,
+    default=None,
+    *,
+    key=None,
+    help=None,
+    **_,
+) -> list:
+    return checkbox_group(
+        str(label),
+        list(options),
+        default=list(default or []),
+        key_prefix=_safe_multiselect_key(str(label), key),
+        help=help,
+        columns=3,
+        ui=st,
+    )
+
+
+def _safe_delta_multiselect(
+    self,
+    label,
+    options,
+    default=None,
+    *,
+    key=None,
+    help=None,
+    **_,
+) -> list:
+    return checkbox_group(
+        str(label),
+        list(options),
+        default=list(default or []),
+        key_prefix=_safe_multiselect_key(str(label), key),
+        help=help,
+        columns=2,
+        ui=self,
+    )
+
+
+st.multiselect = _safe_streamlit_multiselect
+try:
+    from streamlit.delta_generator import DeltaGenerator
+
+    DeltaGenerator.multiselect = _safe_delta_multiselect
+except Exception:
+    pass
+
+
 def add_cartographic_controls(
     fmap: folium.Map,
     analysis: str,
