@@ -6,4 +6,6 @@ __pycache__/
 .env
 work/
 outputs/
-
+streamlit-test*.log
+download
+download (1)

@@ -1,7 +1,5 @@
 """Açık veri kaynakları, değişkenler ve ayrıntılı analiz kataloğu."""
 
-from datetime import date
-
 SOURCES = {
     "Otomatik en uygun açık kaynak": {
         "status": "Hazır",
@@ -106,12 +104,6 @@ ANALYSIS_METHODS = {
         "resolution": "~5,5 km",
         "purpose": "Meteorolojik kuraklığın farklı zaman ölçeklerinde izlenmesi",
     },
-    "SPEI": {
-        "title": "Standartlaştırılmış Yağış-Evapotranspirasyon İndisi",
-        "source": "CHIRPS + ERA5-Land",
-        "resolution": "~5,5–11 km",
-        "purpose": "Yağış ve atmosferik su talebini birlikte kullanarak iklimsel kuraklığın izlenmesi",
-    },
     "NDVI": {
         "title": "Normalize Edilmiş Fark Bitki Örtüsü İndisi",
         "source": "Sentinel-2 L2A",
@@ -179,53 +171,3 @@ ANALYSIS_METHODS = {
         "purpose": "Topoğrafik su birikme potansiyeli",
     },
 }
-
-
-def academic_data_package(components: list[str] | tuple[str, ...]) -> dict[str, object]:
-    """Seçilen akademik bileşenler için gerekli GEE koleksiyonlarını eşleştirir."""
-    allowed = {"SPI", "SPEI", "NDVI", "EVI", "LST"}
-    selected = list(dict.fromkeys(component for component in components if component in allowed))
-    if not selected:
-        selected = ["SPEI"]
-
-    collections: list[str] = []
-    variables: list[str] = []
-
-    def add_unique(target: list[str], *values: str) -> None:
-        for value in values:
-            if value not in target:
-                target.append(value)
-
-    if any(component in selected for component in ("SPI", "SPEI")):
-        add_unique(collections, "CHIRPS")
-        add_unique(variables, "Yağış")
-    if "SPEI" in selected:
-        add_unique(collections, "ERA5-Land")
-        add_unique(variables, "Hava sıcaklığı", "Potansiyel evapotranspirasyon")
-    if any(component in selected for component in ("NDVI", "EVI")):
-        add_unique(collections, "Sentinel-2 SR Harmonized")
-    if "NDVI" in selected:
-        add_unique(variables, "NDVI")
-    if "EVI" in selected:
-        add_unique(variables, "EVI")
-    if "LST" in selected:
-        add_unique(collections, "Landsat 8/9 Collection 2 L2")
-        add_unique(variables, "Yüzey sıcaklığı (LST)")
-    if any(component in selected for component in ("NDVI", "EVI", "LST")):
-        add_unique(collections, "ESA WorldCover")
-        add_unique(variables, "Arazi örtüsü")
-
-    if any(component in selected for component in ("SPI", "SPEI")):
-        start_date = date(1981, 1, 1)
-    elif any(component in selected for component in ("NDVI", "EVI")):
-        start_date = date(2017, 3, 28)
-    else:
-        start_date = date(2013, 4, 11)
-
-    return {
-        "components": selected,
-        "collections": collections,
-        "variables": variables,
-        "label": " + ".join(collections),
-        "start_date": start_date,
-    }

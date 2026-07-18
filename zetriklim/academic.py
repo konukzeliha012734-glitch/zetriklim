@@ -7,6 +7,7 @@ notebook ve test ortamlarında aynı girdilerle aynı sonucu üretir.
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+import base64
 from html import escape
 from typing import Iterable
 
@@ -28,6 +29,60 @@ from zetriklim.spi import classify_spi
 
 
 MIN_FIT_SAMPLES = 10
+
+
+def academic_defaults(focus: str) -> dict[str, object]:
+    """Seçilen araştırma odağı için tamamlayıcı, düzenlenebilir akademik paketi kurar."""
+    focus = str(focus).upper()
+    # SPI odağında da gecikmeli tepki tablosunun boş kalmaması için en uzun ve
+    # yaygın uydu arşivine sahip NDVI otomatik eş değişken olarak eklenir.
+    # EVI ve LST kullanıcı tarafından isteğe bağlı olarak genişletilebilir.
+    remote_methods = {
+        "NDVI", "NDWI", "NDMI", "NDBI", "EVI", "SAVI", "LST",
+        "DEM", "SLOPE", "ASPECT", "TWI",
+    }
+    response = [focus] if focus in remote_methods else ["NDVI"]
+    return {
+        "focus": focus,
+        "drought_indices": ["SPI", "SPEI"],
+        "response_indices": response,
+        "scales": [1, 3, 6, 12, 24] if focus in {"SPI", "LST"} else [1, 3, 6, 12],
+        "title": f"Havza ölçeğinde {focus} odaklı çok kaynaklı iklim analizi",
+        "question": (
+            f"Meteorolojik ve sıcaklık kaynaklı kuraklık koşulları {focus} göstergesinde "
+            "hangi zaman ölçeğinde ve kaç aylık gecikmeyle karşılık bulmaktadır?"
+        ),
+    }
+
+
+def harmonize_monthly_data(data: pd.DataFrame, date_column: str = "Tarih") -> pd.DataFrame:
+    """Farklı günlük/aylık kaynakları tek ve benzersiz aylık gözlem tablosuna dönüştürür."""
+    if date_column not in data:
+        raise ValueError(f"Tarih sütunu bulunamadı: {date_column}")
+    frame = data.copy()
+    frame[date_column] = pd.to_datetime(frame[date_column], errors="coerce")
+    frame = frame.dropna(subset=[date_column]).sort_values(date_column)
+    if frame.empty:
+        raise ValueError("Geçerli tarih içeren kayıt bulunamadı.")
+    frame = frame.replace([np.inf, -np.inf], np.nan).set_index(date_column)
+    aggregations: dict[str, object] = {}
+    for column in frame.columns:
+        values = pd.to_numeric(frame[column], errors="coerce")
+        if values.notna().any():
+            frame[column] = values
+            label = str(column).casefold()
+            is_total = any(
+                token in label
+                for token in ("yağış", "precip", "rain", "pet", "et₀", "evapotrans", "radyasyon", "kar yağışı")
+            )
+            aggregations[column] = (
+                (lambda series: series.sum(min_count=1)) if is_total else "mean"
+            )
+        else:
+            aggregations[column] = lambda series: series.dropna().iloc[0] if series.notna().any() else pd.NA
+    monthly = frame.resample("MS").agg(aggregations).reset_index()
+    monthly = monthly.dropna(axis=1, how="all")
+    return monthly
 
 
 def last_complete_month(today: date | None = None) -> date:
@@ -250,6 +305,14 @@ def detect_drought_events(
     frame[date_column] = pd.to_datetime(frame[date_column], errors="coerce")
     frame[index_column] = pd.to_numeric(frame[index_column], errors="coerce")
     frame = frame.dropna().sort_values(date_column)
+    # Aynı aya ait yinelenen kayıtların olayı yapay biçimde uzatmasını engelle.
+    frame["_ay"] = frame[date_column].dt.to_period("M")
+    frame = (
+        frame.groupby("_ay", as_index=False)[index_column]
+        .mean()
+        .assign(**{date_column: lambda table: table["_ay"].dt.to_timestamp()})
+        [[date_column, index_column]]
+    )
     events: list[dict[str, object]] = []
     current: list[tuple[pd.Timestamp, float]] = []
 
@@ -258,17 +321,25 @@ def detect_drought_events(
             return
         dates = [item[0] for item in current]
         values = np.asarray([item[1] for item in current], dtype=float)
-        severity = float(-values.sum())
+        start_month = dates[0].to_period("M")
+        end_month = dates[-1].to_period("M")
+        duration = int(end_month.ordinal - start_month.ordinal + 1)
+        start_date = start_month.to_timestamp(how="start")
+        end_date = end_month.to_timestamp(how="end").normalize()
+        peak_location = int(np.argmin(values))
+        severity = float(np.abs(np.minimum(values, 0)).sum())
         events.append(
             {
                 "İndis": index_column,
                 "Olay no": len(events) + 1,
-                "Başlangıç": dates[0],
-                "Bitiş": dates[-1],
-                "Süre (ay)": len(values),
+                "Başlangıç": start_date,
+                "Bitiş": end_date,
+                "Süre (ay)": duration,
+                "Olay türü": "Tek aylık" if duration == 1 else "Çok aylık",
+                "Tepe ayı": dates[peak_location].to_period("M").to_timestamp(),
                 "En düşük değer": float(values.min()),
                 "Şiddet": severity,
-                "Ortalama yoğunluk": severity / len(values),
+                "Ortalama yoğunluk": severity / duration,
                 "Eşik": threshold,
             }
         )
@@ -628,10 +699,158 @@ def quality_control_table(
     return pd.DataFrame(rows)
 
 
+def run_remote_sensing_analysis(
+    data: pd.DataFrame,
+    *,
+    response_columns: Iterable[str],
+    config: dict[str, object],
+    date_column: str = "Tarih",
+) -> dict[str, pd.DataFrame]:
+    """NDVI/EVI/LST serileri için bağımsız bulgu paketini üretir.
+
+    Kuraklık indisleri seçilmese bile eğilim, mevsimsel profil, referans dönemi
+    anomalileri, dönemsel değişim ve kalite kontrol sonuçları hazırlanır.
+    """
+    frame = data.copy()
+    frame[date_column] = pd.to_datetime(frame[date_column], errors="coerce")
+    frame = frame.dropna(subset=[date_column]).sort_values(date_column)
+    available = [column for column in response_columns if column in frame]
+    if not available:
+        return {}
+
+    monthly = harmonize_monthly_data(frame, date_column=date_column)
+    baseline_start = int(
+        config.get(
+            "anomaly_baseline_start",
+            config.get("baseline_start", monthly[date_column].dt.year.min()),
+        )
+    )
+    baseline_end = int(
+        config.get(
+            "anomaly_baseline_end",
+            config.get("baseline_end", monthly[date_column].dt.year.max()),
+        )
+    )
+    change_window = max(1, int(config.get("change_window_years", 3)))
+    alpha = float(config.get("alpha", 0.05))
+
+    trends = trend_analysis(
+        monthly,
+        available,
+        date_column=date_column,
+        prewhiten=bool(config.get("prewhiten", True)),
+        include_seasonal=bool(config.get("seasonal_mk", True)),
+        alpha=alpha,
+    )
+
+    seasonal_rows: list[dict[str, object]] = []
+    anomaly = pd.DataFrame({date_column: monthly[date_column]})
+    summary_rows: list[dict[str, object]] = []
+    for column in available:
+        values = pd.to_numeric(monthly[column], errors="coerce")
+        valid = pd.DataFrame({date_column: monthly[date_column], "value": values}).dropna()
+        if valid.empty:
+            continue
+
+        valid["month"] = valid[date_column].dt.month
+        for month, group in valid.groupby("month"):
+            seasonal_rows.append(
+                {
+                    "Değişken": column,
+                    "Ay": int(month),
+                    "Gözlem": len(group),
+                    "Ortalama": float(group["value"].mean()),
+                    "Medyan": float(group["value"].median()),
+                    "Standart sapma": float(group["value"].std(ddof=1)),
+                    "Alt %10": float(group["value"].quantile(0.10)),
+                    "Üst %90": float(group["value"].quantile(0.90)),
+                }
+            )
+
+        baseline_mask = (
+            (valid[date_column].dt.year >= baseline_start)
+            & (valid[date_column].dt.year <= baseline_end)
+        )
+        baseline = valid.loc[baseline_mask]
+        if baseline.empty:
+            baseline = valid
+        climatology_mean = baseline.groupby("month")["value"].mean()
+        climatology_std = baseline.groupby("month")["value"].std(ddof=1).replace(0, np.nan)
+        month_numbers = monthly[date_column].dt.month
+        expected = month_numbers.map(climatology_mean)
+        spread = month_numbers.map(climatology_std)
+        absolute_anomaly = values - expected
+        standardized_anomaly = absolute_anomaly / spread
+        anomaly[column] = values
+        anomaly[f"{column} klimatolojisi"] = expected
+        anomaly[f"{column} anomalisi"] = absolute_anomaly
+        anomaly[f"{column} standart anomalisi"] = standardized_anomaly
+
+        start_limit = valid[date_column].min() + pd.DateOffset(years=change_window)
+        end_limit = valid[date_column].max() - pd.DateOffset(years=change_window)
+        first_values = valid.loc[valid[date_column] < start_limit, "value"]
+        last_values = valid.loc[valid[date_column] > end_limit, "value"]
+        first_mean = float(first_values.mean()) if not first_values.empty else np.nan
+        last_mean = float(last_values.mean()) if not last_values.empty else np.nan
+        change = last_mean - first_mean if np.isfinite(first_mean) and np.isfinite(last_mean) else np.nan
+        change_percent = (
+            100 * change / abs(first_mean)
+            if np.isfinite(change) and np.isfinite(first_mean) and first_mean != 0
+            else np.nan
+        )
+        trend_row = trends.loc[trends["Değişken"] == column]
+        slope_month = float(trend_row.iloc[0]["Sen eğimi / ay"]) if not trend_row.empty else np.nan
+        peak_month = int(climatology_mean.idxmax()) if not climatology_mean.empty else None
+        low_month = int(climatology_mean.idxmin()) if not climatology_mean.empty else None
+        summary_rows.append(
+            {
+                "Değişken": column,
+                "Başlangıç": valid[date_column].min(),
+                "Bitiş": valid[date_column].max(),
+                "Geçerli gözlem": len(valid),
+                "Ortalama": float(valid["value"].mean()),
+                "Medyan": float(valid["value"].median()),
+                "Minimum": float(valid["value"].min()),
+                "Maksimum": float(valid["value"].max()),
+                "Standart sapma": float(valid["value"].std(ddof=1)),
+                "Sen eğimi / yıl": slope_month * 12 if np.isfinite(slope_month) else np.nan,
+                f"İlk {change_window} yıl ortalaması": first_mean,
+                f"Son {change_window} yıl ortalaması": last_mean,
+                "Dönemsel değişim": change,
+                "Dönemsel değişim (%)": change_percent,
+                "En yüksek ortalama ay": peak_month,
+                "En düşük ortalama ay": low_month,
+            }
+        )
+
+    expected_ranges = {
+        column: ((-1, 1) if column.startswith(("NDVI", "EVI")) else (-90, 80))
+        for column in available
+    }
+    for column in monthly.columns:
+        label = str(column).casefold()
+        if "geçerli piksel oranı" in label:
+            expected_ranges[column] = (0, 1)
+        elif "sahne sayısı" in label:
+            expected_ranges[column] = (0, None)
+
+    return {
+        "Uzaktan Algılama Özeti": pd.DataFrame(summary_rows),
+        "Eğilim ve Değişim": trends,
+        "Mevsimsel Profil": pd.DataFrame(seasonal_rows),
+        "Anomali Serisi": anomaly,
+        "Kalite Kontrol": quality_control_table(
+            monthly,
+            date_column=date_column,
+            expected_ranges=expected_ranges,
+        ),
+    }
+
+
 def run_academic_analysis(
     data: pd.DataFrame,
     *,
-    precipitation_column: str | None,
+    precipitation_column: str,
     pet_column: str | None,
     response_columns: Iterable[str],
     validation_columns: Iterable[str],
@@ -642,81 +861,57 @@ def run_academic_analysis(
     baseline_start = int(config.get("baseline_start", 1991))
     baseline_end = int(config.get("baseline_end", 2020))
     drought_indices = list(config.get("drought_indices", ["SPI", "SPEI"]))
-    response_columns = list(response_columns)
-    validation_columns = list(validation_columns)
     results: dict[str, pd.DataFrame] = {}
-    warnings: list[dict[str, str]] = []
 
-    dates = pd.to_datetime(data[date_column], errors="coerce")
-    dates = dates.dt.to_period("M").dt.to_timestamp()
-    drought = pd.DataFrame({"Tarih": dates})
+    drought = pd.DataFrame({"Tarih": pd.to_datetime(data[date_column], errors="coerce")})
     drought = drought.dropna().drop_duplicates("Tarih").sort_values("Tarih")
     diagnostics = []
     if "SPI" in drought_indices:
-        if precipitation_column and precipitation_column in data:
-            spi = calculate_spi_academic(
-                data,
-                precipitation_column,
-                scales,
-                baseline_start=baseline_start,
-                baseline_end=baseline_end,
+        spi = calculate_spi_academic(
+            data,
+            precipitation_column,
+            scales,
+            baseline_start=baseline_start,
+            baseline_end=baseline_end,
+            distribution=str(config.get("spi_distribution", "Gamma")),
+            date_column=date_column,
+        )
+        drought = drought.merge(spi, on="Tarih", how="outer")
+        diagnostics.append(
+            distribution_diagnostics(
+                _monthly_series(data, precipitation_column, date_column),
+                scales=scales,
                 distribution=str(config.get("spi_distribution", "Gamma")),
-                date_column=date_column,
-            )
-            drought = drought.merge(spi, on="Tarih", how="outer")
-            diagnostics.append(
-                distribution_diagnostics(
-                    _monthly_series(data, precipitation_column, date_column),
-                    scales=scales,
-                    distribution=str(config.get("spi_distribution", "Gamma")),
-                    baseline_start=baseline_start,
-                    baseline_end=baseline_end,
-                    index_name="SPI",
-                )
-            )
-        else:
-            warnings.append({"Bileşen": "SPI", "Durum": "Yağış sütunu bulunamadığı için hesaplanmadı."})
-    if "SPEI" in drought_indices:
-        if precipitation_column and precipitation_column in data and pet_column and pet_column in data:
-            spei = calculate_spei_table(
-                data,
-                precipitation_column,
-                pet_column,
-                scales,
                 baseline_start=baseline_start,
                 baseline_end=baseline_end,
+                index_name="SPI",
+            )
+        )
+    if "SPEI" in drought_indices and pet_column and pet_column in data:
+        spei = calculate_spei_table(
+            data,
+            precipitation_column,
+            pet_column,
+            scales,
+            baseline_start=baseline_start,
+            baseline_end=baseline_end,
+            distribution=str(config.get("spei_distribution", "Log-logistic")),
+            date_column=date_column,
+        )
+        drought = drought.merge(spei, on="Tarih", how="outer")
+        water_balance = _monthly_series(data, precipitation_column, date_column) - _monthly_series(data, pet_column, date_column)
+        diagnostics.append(
+            distribution_diagnostics(
+                water_balance,
+                scales=scales,
                 distribution=str(config.get("spei_distribution", "Log-logistic")),
-                date_column=date_column,
+                baseline_start=baseline_start,
+                baseline_end=baseline_end,
+                index_name="SPEI",
             )
-            drought = drought.merge(spei, on="Tarih", how="outer")
-            water_balance = _monthly_series(data, precipitation_column, date_column) - _monthly_series(data, pet_column, date_column)
-            diagnostics.append(
-                distribution_diagnostics(
-                    water_balance,
-                    scales=scales,
-                    distribution=str(config.get("spei_distribution", "Log-logistic")),
-                    baseline_start=baseline_start,
-                    baseline_end=baseline_end,
-                    index_name="SPEI",
-                )
-            )
-        else:
-            warnings.append({"Bileşen": "SPEI", "Durum": "Yağış veya PET sütunu bulunamadığı için hesaplanmadı."})
-    available_responses = list(response_columns)
-    for requested in config.get("response_indices", []):
-        if not any(
-            column == requested or column.startswith(f"{requested}|")
-            for column in available_responses
-        ):
-            warnings.append(
-                {
-                    "Bileşen": str(requested),
-                    "Durum": "Seçilen veri kaynağında geçerli aylık seri bulunamadığı için hesaplanmadı.",
-                }
-            )
+        )
     results["Kuraklık Serisi"] = drought.sort_values("Tarih")
     results["Dağılım Uyum"] = pd.concat(diagnostics, ignore_index=True) if diagnostics else pd.DataFrame()
-    results["Analiz Uyarıları"] = pd.DataFrame(warnings)
 
     index_columns = [
         column
@@ -739,7 +934,6 @@ def run_academic_analysis(
 
     merged = data.copy()
     merged[date_column] = pd.to_datetime(merged[date_column], errors="coerce")
-    merged[date_column] = merged[date_column].dt.to_period("M").dt.to_timestamp()
     merged = merged.merge(drought[["Tarih", *index_columns]], left_on=date_column, right_on="Tarih", how="outer")
     if date_column != "Tarih":
         merged = merged.drop(columns=["Tarih_y"], errors="ignore").rename(columns={"Tarih_x": date_column})
@@ -762,19 +956,14 @@ def run_academic_analysis(
         remove_seasonality=bool(config.get("remove_seasonality", True)),
         alpha=float(config.get("alpha", 0.05)),
     )
-    if precipitation_column and precipitation_column in data:
-        results["Kaynak Doğrulama"] = compare_sources(data, precipitation_column, validation_columns)
-        source_columns = [precipitation_column, *[column for column in validation_columns if column in data]]
-        results["Belirsizlik"] = uncertainty_table(data, source_columns, date_column=date_column)
-    else:
-        results["Kaynak Doğrulama"] = pd.DataFrame()
-        results["Belirsizlik"] = pd.DataFrame()
+    results["Kaynak Doğrulama"] = compare_sources(data, precipitation_column, validation_columns)
+    source_columns = [precipitation_column, *[column for column in validation_columns if column in data]]
+    results["Belirsizlik"] = uncertainty_table(data, source_columns, date_column=date_column)
 
     ranges: dict[str, tuple[float | None, float | None]] = {
-        column: (0, None) for column in validation_columns if column in data
+        precipitation_column: (0, None),
+        **{column: (0, None) for column in validation_columns if column in data},
     }
-    if precipitation_column and precipitation_column in data:
-        ranges[precipitation_column] = (0, None)
     if pet_column:
         ranges[pet_column] = (0, None)
     for column in response_columns:
@@ -788,59 +977,7 @@ def run_academic_analysis(
         elif "sahne sayısı" in column.lower():
             ranges[column] = (0, None)
     results["Kalite Kontrol"] = quality_control_table(data, date_column=date_column, expected_ranges=ranges)
-    results["Birleşik Analiz Serisi"] = prepare_academic_series_export(
-        data,
-        results["Kuraklık Serisi"],
-        date_column=date_column,
-    )
     return results
-
-
-def prepare_academic_series_export(
-    source_data: pd.DataFrame,
-    drought_series: pd.DataFrame | None,
-    *,
-    date_column: str = "Tarih",
-) -> pd.DataFrame:
-    """Kaynak değişkenleri ile hesaplanan indisleri tek, yinelenmeyen aylık seride birleştirir."""
-    if date_column not in source_data:
-        raise ValueError(f"Tarih sütunu bulunamadı: {date_column}")
-    monthly = source_data.copy()
-    monthly[date_column] = pd.to_datetime(monthly[date_column], errors="coerce")
-    monthly = monthly.dropna(subset=[date_column])
-    monthly[date_column] = monthly[date_column].dt.to_period("M").dt.to_timestamp()
-
-    aggregations: dict[str, str] = {}
-    for column in monthly.columns:
-        if column == date_column:
-            continue
-        numeric = pd.to_numeric(monthly[column], errors="coerce")
-        if numeric.notna().any():
-            monthly[column] = numeric
-            aggregations[column] = "mean"
-        else:
-            aggregations[column] = "first"
-    monthly = monthly.groupby(date_column, as_index=False).agg(aggregations).sort_values(date_column)
-
-    if drought_series is not None and not drought_series.empty:
-        calculated = drought_series.copy()
-        calculated["Tarih"] = pd.to_datetime(calculated["Tarih"], errors="coerce")
-        calculated = calculated.dropna(subset=["Tarih"])
-        calculated["Tarih"] = calculated["Tarih"].dt.to_period("M").dt.to_timestamp()
-        calculated = calculated.drop_duplicates("Tarih", keep="last").sort_values("Tarih")
-        overlap = [column for column in calculated.columns if column in monthly.columns and column != "Tarih"]
-        monthly = monthly.drop(columns=overlap, errors="ignore")
-        monthly = monthly.merge(calculated, left_on=date_column, right_on="Tarih", how="outer")
-        if date_column != "Tarih":
-            monthly = monthly.drop(columns=[date_column], errors="ignore")
-    elif date_column != "Tarih":
-        monthly = monthly.rename(columns={date_column: "Tarih"})
-
-    monthly["Tarih"] = pd.to_datetime(monthly["Tarih"], errors="coerce")
-    monthly = monthly.dropna(subset=["Tarih"]).drop_duplicates("Tarih").sort_values("Tarih")
-    monthly.insert(1, "Yıl", monthly["Tarih"].dt.year)
-    monthly.insert(2, "Ay", monthly["Tarih"].dt.month)
-    return monthly.reset_index(drop=True)
 
 
 def build_academic_report_html(
@@ -849,64 +986,141 @@ def build_academic_report_html(
     config: dict[str, object],
     results: dict[str, pd.DataFrame],
     source_note: str,
+    context: dict[str, object] | None = None,
+    figures: dict[str, bytes] | None = None,
 ) -> bytes:
-    """Yöntem, bulgular ve sınırlılıkları taşıyan bağımsız HTML raporu üretir."""
-    title = escape(str(study.get("title") or "Zetriklim Akademik Kuraklık Araştırması"))
-    question = escape(str(study.get("question") or "Tanımlanmadı"))
-    hypotheses = escape(str(study.get("hypotheses") or "Tanımlanmadı")).replace("\n", "<br>")
+    """Yöntem, bulgu, kalite ve ekleri kapsayan bağımsız analiz raporu üretir."""
+    context = context or {}
+    figures = figures or {}
+    title = escape(str(study.get("title") or "Zetriklim İklim Analizi"))
     created = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    event_table = results.get("Kuraklık Olayları", pd.DataFrame())
+    trend_table = results.get("Eğilim ve Değişim", pd.DataFrame())
+    lag_table = results.get("Gecikmeli İlişki", pd.DataFrame())
+    validation_table = results.get("Kaynak Doğrulama", pd.DataFrame())
+    quality_table = results.get("Kalite Kontrol", pd.DataFrame())
+    significant_trends = int(
+        trend_table.get("Anlamlı eğilim", pd.Series(dtype=bool)).fillna(False).astype(bool).sum()
+    ) if not trend_table.empty else 0
+    significant_lags = int(
+        lag_table.get("Anlamlı", pd.Series(dtype=bool)).fillna(False).astype(bool).sum()
+    ) if not lag_table.empty else 0
+    max_duration = int(pd.to_numeric(event_table.get("Süre (ay)"), errors="coerce").max()) if not event_table.empty else 0
+    worst_index = "—"
+    if not event_table.empty and "En düşük değer" in event_table:
+        minimums = pd.to_numeric(event_table["En düşük değer"], errors="coerce")
+        if minimums.notna().any():
+            row = event_table.loc[minimums.idxmin()]
+            worst_index = f"{row.get('İndis', '—')} ({float(minimums.min()):.2f})"
+
+    context_rows = "".join(
+        f"<tr><th>{escape(str(key))}</th><td>{escape(str(value))}</td></tr>"
+        for key, value in context.items()
+        if value not in {None, ""}
+    )
+    parameter_labels = {
+        "focus": "Ana analiz odağı", "drought_indices": "Kuraklık indisleri",
+        "response_indices": "Tepki değişkenleri", "scales": "Zaman ölçekleri (ay)",
+        "baseline_start": "Referans başlangıcı", "baseline_end": "Referans bitişi",
+        "spi_distribution": "SPI dağılımı", "spei_distribution": "SPEI dağılımı",
+        "event_threshold": "Olay eşiği", "prewhiten": "Otokorelasyon düzeltmesi",
+        "seasonal_mk": "Mevsimsel MK", "alpha": "Anlamlılık düzeyi",
+        "max_lag": "Azami gecikme (ay)", "correlation_method": "İlişki yöntemi",
+        "remove_seasonality": "Mevsimsellik giderimi", "land_cover_labels": "Arazi örtüsü sınıfları",
+    }
+    parameter_rows = "".join(
+        f"<tr><th>{escape(parameter_labels.get(key, str(key)))}</th>"
+        f"<td>{escape(', '.join(map(str, value)) if isinstance(value, (list, tuple, set)) else str(value))}</td></tr>"
+        for key, value in config.items()
+        if key in parameter_labels
+    )
+
+    figure_blocks = []
+    for caption, content in figures.items():
+        if not content:
+            continue
+        encoded = base64.b64encode(content).decode("ascii")
+        figure_blocks.append(
+            f"<figure><img src='data:image/png;base64,{encoded}' alt='{escape(caption)}'>"
+            f"<figcaption>{escape(caption)}</figcaption></figure>"
+        )
+
     sections = []
     for name, table in results.items():
         if table is None or table.empty:
             continue
-        preview = table.head(250).copy()
+        preview = table.head(500).copy()
         sections.append(
-            f"<section><h2>{escape(name)}</h2>"
-            f"<p>Toplam {len(table):,} kayıt; raporda ilk {len(preview):,} kayıt gösterilmektedir.</p>"
+            f"<section class='appendix'><h3>{escape(name)}</h3>"
+            f"<p>Toplam {len(table):,} kayıt; bu ekte ilk {len(preview):,} kayıt gösterilmektedir. "
+            "Eksiksiz tablo proje paketindeki CSV/Excel dosyasındadır.</p>"
             f"{preview.to_html(index=False, border=0, classes='dataframe', na_rep='—')}</section>"
         )
-    index_methods = []
-    drought_indices = list(config.get("drought_indices", []))
-    if "SPI" in drought_indices:
-        index_methods.append(
-            f"SPI: {escape(str(config.get('spi_distribution', 'Gamma')))} dağılımı ve sıfır olasılığı düzeltmesi"
-        )
-    if "SPEI" in drought_indices:
-        index_methods.append(
-            f"SPEI: {escape(str(config.get('spei_distribution', 'Log-logistic')))} dağılımı"
-        )
-    response_indices = list(config.get("response_indices", []))
-    if response_indices:
-        index_methods.append(
-            "Ekosistem/yüzey değişkenleri: " + escape(", ".join(map(str, response_indices)))
-        )
     methodology = (
-        ("; ".join(index_methods) + ". " if index_methods else "")
-        + f"Referans dönemi {config.get('baseline_start', 1991)}–{config.get('baseline_end', 2020)}; "
-        f"ölçekler {escape(', '.join(map(str, config.get('scales', [])))) or 'uygulanmadı'} ay. "
-        "Seçili bütün değişkenlerin eğilimleri Mann–Kendall, trend-free prewhitening, Sen eğimi ve Pettitt testiyle; "
+        f"SPI: {escape(str(config.get('spi_distribution', 'Gamma')))} dağılımı ve sıfır olasılığı düzeltmesi; "
+        f"SPEI: {escape(str(config.get('spei_distribution', 'Log-logistic')))} dağılımı; "
+        f"referans dönemi {config.get('baseline_start', 1991)}–{config.get('baseline_end', 2020)}; "
+        f"ölçekler {escape(', '.join(map(str, config.get('scales', []))))} ay. "
+        "Eğilimler Mann–Kendall, trend-free prewhitening, Sen eğimi ve Pettitt testiyle; "
         "çoklu karşılaştırmalar Benjamini–Hochberg FDR düzeltmesiyle değerlendirilmiştir."
+    )
+    quality_note = (
+        f"Kalite kontrolü {len(quality_table):,} değişken/ölçüt satırı üretmiştir. "
+        "Eksik ay, yinelenen tarih, fiziksel aralık ve uydu geçerli piksel oranları ayrı ayrı raporlanmıştır."
+        if not quality_table.empty
+        else "Kalite kontrol tablosu üretilememiştir; sonuçlar yorumlanmadan önce veri bütünlüğü ayrıca doğrulanmalıdır."
     )
     html = f"""<!doctype html>
 <html lang="tr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title}</title><style>
-body{{font-family:Arial,sans-serif;color:#173f4b;background:#f6fbf9;margin:0;padding:2rem;line-height:1.55}}
-main{{max-width:1180px;margin:auto;background:white;padding:2rem;border-radius:20px;box-shadow:0 10px 32px #06344718}}
-h1,h2{{color:#075b68}} h1{{border-bottom:4px solid #00a6a6;padding-bottom:.6rem}}
+@page{{size:A4;margin:18mm}} *{{box-sizing:border-box}}
+body{{font-family:Arial,sans-serif;color:#173f4b;background:#eef4f2;margin:0;padding:2rem;line-height:1.58}}
+main{{max-width:1180px;margin:auto;background:white;padding:2.4rem;border-radius:14px;box-shadow:0 10px 32px #06344718}}
+h1,h2,h3{{color:#075b68}} h1{{border-bottom:4px solid #00a6a6;padding-bottom:.7rem;margin-bottom:.4rem}}
+h2{{border-bottom:1px solid #b8d8d3;padding-bottom:.35rem;margin-top:2.4rem}}
 .meta{{background:#e8f7f4;padding:1rem;border-left:4px solid #00a6a6;border-radius:8px}}
+.toc{{columns:2;background:#f6faf9;padding:1rem 1.4rem;border:1px solid #d8e8e5;border-radius:8px}}
+.toc a{{color:#075b68;text-decoration:none}} .cards{{display:grid;grid-template-columns:repeat(4,1fr);gap:.7rem}}
+.card{{background:#f1f8f6;border-top:4px solid #00a6a6;padding:.8rem;border-radius:6px}}
+.card b{{display:block;font-size:1.35rem;color:#063447}} .method{{background:#f8faf9;padding:1rem;border-left:3px solid #607d8b}}
 table{{border-collapse:collapse;width:100%;font-size:.82rem;display:block;overflow-x:auto}}
 th{{background:#063447;color:white;position:sticky;top:0}} th,td{{padding:.45rem;border:1px solid #d8e8e5}}
 tr:nth-child(even){{background:#f2faf8}} section{{margin-top:2rem}} .warning{{background:#fff4df;padding:1rem;border-left:4px solid #ffad33}}
+.caution{{background:#fdecec;padding:1rem;border-left:4px solid #c62828}} figure{{margin:1.5rem 0;break-inside:avoid}}
+figure img{{max-width:100%;height:auto;border:1px solid #b0bec5}} figcaption{{font-size:.82rem;color:#546e7a;text-align:center}}
+.two-col{{display:grid;grid-template-columns:1fr 1fr;gap:1rem}} .kv th{{width:35%;text-align:left}}
+footer{{margin-top:3rem;border-top:1px solid #cfd8dc;padding-top:1rem;font-size:.78rem;color:#607d8b}}
+@media(max-width:800px){{.cards,.two-col{{grid-template-columns:1fr}}.toc{{columns:1}}body{{padding:.5rem}}main{{padding:1rem}}}}
+@media print{{body{{background:white;padding:0}}main{{box-shadow:none;max-width:none;padding:0}}.appendix{{break-before:page}}}}
 </style></head><body><main>
-<h1>{title}</h1><div class="meta"><b>Oluşturulma:</b> {created}<br><b>Veri kaynağı:</b> {escape(source_note)}</div>
-<h2>Araştırma tasarımı</h2><p><b>Soru:</b> {question}</p><p><b>Hipotezler:</b><br>{hypotheses}</p>
-<h2>Yöntem</h2><p>{methodology}</p>
-<div class="warning"><b>Bilimsel kullanım notu:</b> Bu otomatik rapor yöntem ve sonuç tablolarını yeniden üretilebilir biçimde derler. Bulgular; alan bilgisi, veri kalitesi, istasyon doğrulaması ve danışman değerlendirmesiyle yorumlanmalıdır.</div>
-{''.join(sections)}
-<h2>Temel kaynaklar</h2><ul>
+<h1>{title}</h1><p><b>Zetriklim bilimsel analiz raporu</b></p>
+<div class="meta"><b>Oluşturulma:</b> {created}<br><b>Veri kaynağı:</b> {escape(source_note)}<br>
+<b>Rapor kapsamı:</b> veri kökeni, yöntem, kalite kontrol, kuraklık olayları, eğilim, gecikmeli ilişki, doğrulama ve belirsizlik.</div>
+<h2 id="ozet">Yönetici özeti</h2>
+<p>Bu çalışma, tanımlanan coğrafi alan için çok ölçekli kuraklık indislerini ve seçilmiş ekosistem tepki değişkenlerini yeniden üretilebilir bir iş akışında değerlendirmiştir. Toplam <b>{len(event_table):,}</b> kuraklık olayı belirlenmiş; en uzun olay <b>{max_duration}</b> ay sürmüş ve en düşük indis değeri <b>{escape(worst_index)}</b> olarak kaydedilmiştir. Eğilim analizinde <b>{significant_trends}</b>, gecikmeli ilişki analizinde <b>{significant_lags}</b> FDR-düzeltilmiş anlamlı sonuç bulunmuştur.</p>
+<div class="cards"><div class="card"><span>Kuraklık olayı</span><b>{len(event_table):,}</b></div><div class="card"><span>En uzun süre</span><b>{max_duration} ay</b></div><div class="card"><span>Anlamlı eğilim</span><b>{significant_trends}</b></div><div class="card"><span>Anlamlı gecikme</span><b>{significant_lags}</b></div></div>
+<h2>İçindekiler</h2><ol class="toc"><li><a href="#veri">Çalışma alanı ve veri</a></li><li><a href="#yontem">Yöntem</a></li><li><a href="#kalite">Kalite güvencesi</a></li><li><a href="#bulgular">Bulguların yorumu</a></li><li><a href="#sinir">Sınırlılıklar</a></li><li><a href="#ekler">Sonuç tabloları</a></li><li><a href="#kaynaklar">Kaynaklar</a></li></ol>
+<h2 id="veri">1. Çalışma alanı, dönem ve veri kökeni</h2><div class="two-col"><table class="kv">{context_rows or '<tr><th>Bağlam</th><td>Metadata dosyasına bakınız.</td></tr>'}</table><table class="kv"><tr><th>Kaynak zinciri</th><td>{escape(source_note)}</td></tr><tr><th>Zamansal işlem</th><td>Aylık; yağış/PET toplamı, sıcaklık ve uydu indisleri ortalama/kompozit</td></tr><tr><th>Mekânsal işlem</th><td>Çalışma alanı/havza ortalaması ve sınırına kırpılmış raster</td></tr></table></div>
+{''.join(figure_blocks)}
+<h2 id="yontem">2. Yöntem</h2><div class="method"><p>{methodology}</p></div>
+<h3>2.1 Kuraklık indisleri</h3><p>SPI yağış olasılık dağılımını, SPEI ise P−PET iklimsel su dengesini standart normal uzaya dönüştürür. Hesaplar her takvim ayı ve zaman ölçeği için ayrı yürütülür; referans dönem dışındaki aylar aynı uyum parametreleriyle değerlendirilir.</p>
+<h3>2.2 Kuraklık olay tanımı</h3><p>İndisin seçilen eşiğe eşit veya daha düşük olduğu ardışık takvim ayları tek olay kabul edilir. Başlangıç olayın ilk ayının ilk günü, bitiş son ayın son günüdür. “Olay türü” alanı bir aylık ve çok aylık olayları açık metinle ayırır. Şiddet olay aylarındaki negatif indis büyüklüklerinin toplamı, yoğunluk şiddetin süreye oranıdır.</p>
+<h3>2.3 Eğilim ve değişim</h3><p>Mann–Kendall testi monoton eğilimi, Sen eğimi değişim büyüklüğünü, Pettitt testi olası kırılma tarihini değerlendirir. Seçildiğinde trend-free prewhitening serisel bağımlılığı azaltır; mevsimsel test takvim aylarını ayrı tabakalarda karşılaştırır.</p>
+<h3>2.4 Gecikmeli ilişki, doğrulama ve belirsizlik</h3><p>Kuraklık–ekosistem ilişkileri seçilen korelasyon yöntemiyle 0–{escape(str(config.get('max_lag', 6)))} ay arasında sınanır. p-değerleri Benjamini–Hochberg FDR ile düzeltilir. Kaynak karşılaştırmasında Bias, MAE, RMSE, Pearson r, Spearman rho ve KGE; belirsizlikte kaynaklar arası standart sapma ve göreli yayılım raporlanır.</p>
+<h3>2.5 Tam yeniden üretim parametreleri</h3><table class="kv">{parameter_rows}</table>
+<h2 id="kalite">3. Kalite güvencesi</h2><p>{escape(quality_note)}</p><div class="warning"><b>Eksik değer politikası:</b> Kaynakta bulunmayan gözlemler uydurulmaz; “Veri yok”/boş hücre olarak korunur ve kalite kontrol tablosunda sayılır. Uydu arşivi öncesindeki boşluklar iklim serisi eksikliğiyle karıştırılmaz.</div>
+<h2 id="bulgular">4. Bulguların bilimsel yorumu</h2><p>Olay kataloğunda başlangıç ve bitiş aynı ay içinde görünüyorsa bu, hatalı tarih değil, <b>tek aylık olay</b> anlamına gelir; bitiş ayın son günü ve “Olay türü” alanı “Tek aylık” olarak gösterilir. Çok aylık olaylarda süre başlangıç ve bitiş ayları arasındaki kapsayıcı takvim ayı farkıdır.</p>
+<p>Eğilim veya korelasyonun istatistiksel anlamlı olması nedensellik kanıtı değildir. Etki büyüklüğü, güven aralığı, örnek sayısı, veri kalitesi, arazi örtüsü ve bağımsız istasyon karşılaştırması birlikte değerlendirilmelidir.</p>
+<h2 id="sinir">5. Sınırlılıklar ve uygun kullanım</h2><div class="caution"><b>Bilimsel karar notu:</b> Bu rapor otomatik ve yeniden üretilebilir bir analiz kaydıdır; tek başına afet ilanı, ürün kaybı tahmini veya nedensel etki kanıtı değildir. Uydu bulut maskeleri, ürün çözünürlük farkları, yeniden analiz model belirsizliği, sabit arazi örtüsü yılı ve istasyon temsil hatası sonuçlara yansıyabilir.</div>
+<h2 id="ekler">6. Sonuç tabloları ve ekler</h2>{''.join(sections)}
+<h2 id="kaynaklar">7. Temel kaynaklar</h2><ul>
 <li>WMO (2012), <a href="https://library.wmo.int/idurl/4/39629">Standardized Precipitation Index User Guide</a>, WMO-No. 1090.</li>
 <li>Vicente-Serrano, Beguería ve López-Moreno (2010), <a href="https://doi.org/10.1175/2009JCLI2909.1">A Multiscalar Drought Index Sensitive to Global Warming</a>.</li>
 <li>Funk ve diğerleri (2015), <a href="https://doi.org/10.1038/sdata.2015.66">The climate hazards infrared precipitation with stations (CHIRPS)</a>.</li>
 <li>Muñoz-Sabater ve diğerleri (2021), <a href="https://doi.org/10.5194/essd-13-4349-2021">ERA5-Land: a state-of-the-art global reanalysis dataset for land applications</a>.</li>
-</ul></main></body></html>"""
+<li>Mann (1945), <i>Nonparametric Tests Against Trend</i>; Kendall (1975), <i>Rank Correlation Methods</i>.</li>
+<li>Sen (1968), <i>Estimates of the Regression Coefficient Based on Kendall's Tau</i>.</li>
+<li>Benjamini ve Hochberg (1995), <i>Controlling the False Discovery Rate</i>.</li>
+</ul><footer>Bu rapor Zetriklim tarafından aynı proje paketindeki metadata, CSV, Excel, GeoTIFF ve harita çıktılarıyla birlikte üretilmiştir. Tam denetlenebilirlik için zetriklim-metadata.json ve kalite-kontrol.csv dosyalarını raporla birlikte saklayınız.</footer></main></body></html>"""
     return html.encode("utf-8")

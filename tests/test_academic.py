@@ -16,6 +16,7 @@ from zetriklim.academic import (
     safe_monthly_end,
     trend_analysis,
     run_academic_analysis,
+    run_remote_sensing_analysis,
     validation_metrics,
 )
 
@@ -73,7 +74,22 @@ class AcademicAnalysisTests(unittest.TestCase):
         )
         events = detect_drought_events(data, "SPI-3")
         self.assertEqual(len(events), 2)
+        self.assertEqual(events.iloc[0]["Başlangıç"], pd.Timestamp("2020-02-01"))
+        self.assertEqual(events.iloc[0]["Bitiş"], pd.Timestamp("2020-03-31"))
         self.assertEqual(events.iloc[1]["Süre (ay)"], 3)
+        self.assertEqual(events.iloc[1]["Bitiş"], pd.Timestamp("2020-07-31"))
+
+    def test_single_month_drought_event_is_explicit(self) -> None:
+        data = pd.DataFrame(
+            {
+                "Tarih": ["2021-01-01", "2021-02-01", "2021-03-01"],
+                "SPI-1": [0.1, -1.4, 0.2],
+            }
+        )
+        event = detect_drought_events(data, "SPI-1").iloc[0]
+        self.assertEqual(event["Başlangıç"], pd.Timestamp("2021-02-01"))
+        self.assertEqual(event["Bitiş"], pd.Timestamp("2021-02-28"))
+        self.assertEqual(event["Olay türü"], "Tek aylık")
 
     def test_lag_detection(self) -> None:
         data = self.frame.copy()
@@ -90,6 +106,35 @@ class AcademicAnalysisTests(unittest.TestCase):
         self.assertTrue(bool(trend.iloc[0]["Anlamlı eğilim"]))
         metrics = validation_metrics(pd.Series([1, 2, 3, 4]), pd.Series([1.1, 1.9, 3.2, 3.8]))
         self.assertLess(metrics["RMSE"], 0.25)
+
+    def test_standalone_ndvi_analysis_has_complete_findings(self) -> None:
+        results = run_remote_sensing_analysis(
+            self.frame[["Tarih", "NDVI"]],
+            response_columns=["NDVI"],
+            config={
+                "anomaly_baseline_start": 1991,
+                "anomaly_baseline_end": 2020,
+                "change_window_years": 3,
+                "prewhiten": True,
+                "seasonal_mk": True,
+                "alpha": 0.05,
+            },
+        )
+        self.assertEqual(
+            set(results),
+            {
+                "Uzaktan Algılama Özeti",
+                "Eğilim ve Değişim",
+                "Mevsimsel Profil",
+                "Anomali Serisi",
+                "Kalite Kontrol",
+            },
+        )
+        self.assertEqual(len(results["Mevsimsel Profil"]), 12)
+        self.assertIn("NDVI standart anomalisi", results["Anomali Serisi"])
+        summary = results["Uzaktan Algılama Özeti"].iloc[0]
+        self.assertGreater(summary["Geçerli gözlem"], 500)
+        self.assertTrue(np.isfinite(summary["Sen eğimi / yıl"]))
 
     def test_full_bundle_and_report(self) -> None:
         data = self.frame.copy()
@@ -109,14 +154,21 @@ class AcademicAnalysisTests(unittest.TestCase):
             },
         )
         self.assertFalse(results["Kuraklık Serisi"].empty)
+        self.assertFalse(results["Gecikmeli İlişki"].empty)
         self.assertFalse(results["Kaynak Doğrulama"].empty)
+        self.assertFalse(results["Belirsizlik"].empty)
         report = build_academic_report_html(
             study={"title": "Test", "question": "Soru", "hypotheses": "H1"},
             config={"scales": [3, 12], "baseline_start": 1991, "baseline_end": 2020},
             results=results,
             source_note="Sentetik veri",
+            context={"Çalışma alanı": "100 km²", "Dönem": "1981–2024"},
+            figures={"Test şekli": b"\x89PNG\r\n"},
         )
         self.assertIn(b"<!doctype html>", report)
+        self.assertIn("Yönetici özeti".encode("utf-8"), report)
+        self.assertIn("Kuraklık olay tanımı".encode("utf-8"), report)
+        self.assertIn(b"data:image/png;base64", report)
         self.assertGreater(len(report), 10_000)
 
 

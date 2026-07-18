@@ -1,9 +1,0 @@
-.venv/
-__pycache__/
-.streamlit/secrets.toml
-*.pem
-*service-account*.json
-outputs/
-*.pyc
-client_secret*.json
-*.private-key.json

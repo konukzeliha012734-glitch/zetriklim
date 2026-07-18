@@ -3,22 +3,25 @@
 from __future__ import annotations
 
 import io
-import json
 import os
-import subprocess
-import sys
 import tempfile
 import zipfile
 from datetime import date
 from pathlib import Path
 
 import ee
+import geopandas as gpd
 import numpy as np
 import pandas as pd
+import rasterio
 import requests
 from google.oauth2.credentials import Credentials
 from dateutil.relativedelta import relativedelta
+from rasterio.io import MemoryFile
+from rasterio.features import geometry_mask
+from rasterio.mask import mask as raster_mask
 
+from zetriklim.spi import calculate_spi_pixel_stack
 
 
 CHIRPS_DAILY = "UCSB-CHG/CHIRPS/DAILY"
@@ -221,8 +224,6 @@ def _ee_geometry(gdf: gpd.GeoDataFrame) -> ee.Geometry:
 
 
 def _centroid_latlon(gdf: gpd.GeoDataFrame) -> tuple[float, float]:
-    import geopandas as gpd
-
     wgs84 = gdf.to_crs(4326)
     metric_crs = wgs84.estimate_utm_crs() or "EPSG:6933"
     centroid_metric = wgs84[["geometry"]].dissolve().to_crs(metric_crs).geometry.iloc[0].centroid
@@ -267,6 +268,59 @@ def _mask_landsat_l2(image: ee.Image) -> ee.Image:
         .And(image.select("QA_RADSAT").eq(0))
     )
     return image.updateMask(clear).copyProperties(image, ["system:time_start"])
+
+
+def _download_analysis_image(
+    image: ee.Image,
+    gdf: gpd.GeoDataFrame,
+    scale: int,
+    description: str,
+    tags: dict[str, str],
+) -> bytes:
+    geometry = _ee_geometry(gdf)
+    url = image.clip(geometry).getDownloadURL(
+        {
+            "region": geometry,
+            "scale": scale,
+            "format": "GEO_TIFF",
+            "filePerBand": False,
+            "crs": "EPSG:4326",
+        }
+    )
+    response = requests.get(url, timeout=300)
+    response.raise_for_status()
+    content = response.content
+    if content[:2] == b"PK":
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            tif_name = next(name for name in archive.namelist() if name.lower().endswith(".tif"))
+            content = archive.read(tif_name)
+
+    with MemoryFile(content) as memory:
+        with memory.open() as src:
+            raster_geometry = [
+                geometry.__geo_interface__
+                for geometry in gdf.to_crs(src.crs).geometry
+            ]
+            nodata = -9999.0
+            data, transform = raster_mask(
+                src, raster_geometry, crop=True, filled=True, nodata=nodata
+            )
+            profile = src.profile.copy()
+            profile.update(
+                count=1,
+                height=data.shape[1],
+                width=data.shape[2],
+                transform=transform,
+                dtype="float32",
+                nodata=nodata,
+                compress="deflate",
+            )
+            with MemoryFile() as output:
+                with output.open(**profile) as dst:
+                    dst.write(data.astype("float32"))
+                    dst.set_band_description(1, description)
+                    dst.update_tags(**tags)
+                return output.read()
 
 
 def build_remote_analysis_geotiff(
@@ -537,6 +591,7 @@ def fetch_gee_academic_series(
     *,
     response_indices: list[str] | None = None,
     land_cover_codes: list[int] | None = None,
+    include_climate: bool = True,
     project: str | None = None,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
     """Çok kaynaklı aylık kuraklık ve uydu serilerini havza ortalaması olarak getirir.
@@ -567,39 +622,41 @@ def fetch_gee_academic_series(
         following = month + relativedelta(months=1)
         start = month.isoformat()
         end = following.isoformat()
-        chirps_month = (
-            chirps.filterDate(start, end).sum().rename("CHIRPS yağış (mm)")
-        )
-        era_month = era5_land.filterDate(start, end)
-        era_precip = (
-            era_month.select("total_precipitation_sum")
-            .sum()
-            .multiply(1000)
-            .max(0)
-            .rename("ERA5-Land yağış (mm)")
-        )
-        temperature = (
-            era_month.select("temperature_2m")
-            .mean()
-            .subtract(273.15)
-            .rename("ERA5-Land sıcaklık (°C)")
-        )
-        # ECMWF akı işaret konvansiyonunda buharlaşma yukarı yönlü olduğu için negatiftir.
-        pet = (
-            era_month.select("potential_evaporation_sum")
-            .sum()
-            .multiply(-1000)
-            .max(0)
-            .rename("ERA5-Land PET (mm)")
-        )
-        climate = ee.Image.cat(chirps_month, era_precip, temperature, pet)
-        properties = climate.reduceRegion(
-            reducer=ee.Reducer.mean(),
-            geometry=geometry,
-            scale=CHIRPS_SCALE_M,
-            bestEffort=True,
-            maxPixels=1e9,
-        )
+        properties = ee.Dictionary({})
+        if include_climate:
+            chirps_month = (
+                chirps.filterDate(start, end).sum().rename("CHIRPS yağış (mm)")
+            )
+            era_month = era5_land.filterDate(start, end)
+            era_precip = (
+                era_month.select("total_precipitation_sum")
+                .sum()
+                .multiply(1000)
+                .max(0)
+                .rename("ERA5-Land yağış (mm)")
+            )
+            temperature = (
+                era_month.select("temperature_2m")
+                .mean()
+                .subtract(273.15)
+                .rename("ERA5-Land sıcaklık (°C)")
+            )
+            # ECMWF akı işaret konvansiyonunda buharlaşma yukarı yönlü olduğu için negatiftir.
+            pet = (
+                era_month.select("potential_evaporation_sum")
+                .sum()
+                .multiply(-1000)
+                .max(0)
+                .rename("ERA5-Land PET (mm)")
+            )
+            climate = ee.Image.cat(chirps_month, era_precip, temperature, pet)
+            properties = climate.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=geometry,
+                scale=CHIRPS_SCALE_M,
+                bestEffort=True,
+                maxPixels=1e9,
+            )
 
         if requested.intersection({"NDVI", "EVI"}) and month >= date(2015, 6, 23):
             sentinel = (
@@ -749,6 +806,7 @@ def fetch_gee_academic_series(
         rows.append(row)
     frame = pd.DataFrame(rows).sort_values("Tarih").reset_index(drop=True)
     metadata = {
+        "include_climate_support": include_climate,
         "datasets": {
             "CHIRPS": {
                 "id": CHIRPS_DAILY,
@@ -794,89 +852,6 @@ def _rolling_month_image(collection: ee.ImageCollection, month: date, scale_mont
     )
 
 
-def _extract_geotiff_content(content: bytes) -> bytes:
-    if content[:2] != b"PK":
-        return content
-    with zipfile.ZipFile(io.BytesIO(content)) as archive:
-        tif_name = next(name for name in archive.namelist() if name.lower().endswith(".tif"))
-        return archive.read(tif_name)
-
-
-def _write_boundary_json(gdf: gpd.GeoDataFrame, output_path: Path) -> None:
-    output_path.write_text(
-        json.dumps(json.loads(gdf.to_crs(4326).to_json(drop_id=True)), ensure_ascii=False),
-        encoding="utf-8",
-    )
-
-
-def _run_raster_worker(command: list[str], output_path: Path, *, timeout: int = 240) -> bytes:
-    completed = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
-    if completed.returncode != 0 or not output_path.exists():
-        detail = (completed.stderr or completed.stdout or "bilinmeyen raster işleme hatası").strip()
-        raise RuntimeError(f"Raster güvenli işlemde üretilemedi: {detail}")
-    return output_path.read_bytes()
-
-
-def _mask_downloaded_geotiff(
-    content: bytes,
-    gdf: gpd.GeoDataFrame,
-    description: str,
-    tags: dict[str, str],
-) -> bytes:
-    geotiff = _extract_geotiff_content(content)
-    with tempfile.TemporaryDirectory(prefix="zetriklim_raster_mask_") as temp:
-        folder = Path(temp)
-        input_path = folder / "input.tif"
-        boundary_path = folder / "boundary.json"
-        output_path = folder / "masked.tif"
-        input_path.write_bytes(geotiff)
-        _write_boundary_json(gdf, boundary_path)
-        return _run_raster_worker(
-            [
-                sys.executable,
-                "-m",
-                "zetriklim.raster_worker",
-                "mask-geotiff",
-                str(input_path),
-                str(boundary_path),
-                str(output_path),
-                "--description",
-                description,
-                "--tags",
-                json.dumps(tags, ensure_ascii=False),
-            ],
-            output_path,
-        )
-
-
-def _download_analysis_image(
-    image: ee.Image,
-    gdf: gpd.GeoDataFrame,
-    scale: int,
-    description: str,
-    tags: dict[str, str],
-) -> bytes:
-    geometry = _ee_geometry(gdf)
-    url = image.clip(geometry).getDownloadURL(
-        {
-            "region": geometry,
-            "scale": scale,
-            "format": "GEO_TIFF",
-            "filePerBand": False,
-            "crs": "EPSG:4326",
-        }
-    )
-    response = requests.get(url, timeout=300)
-    response.raise_for_status()
-    return _mask_downloaded_geotiff(response.content, gdf, description, tags)
-
-
 def build_chirps_spi_geotiff(
     gdf: gpd.GeoDataFrame,
     target_date: date,
@@ -912,41 +887,43 @@ def build_chirps_spi_geotiff(
     )
     response = requests.get(url, timeout=300)
     response.raise_for_status()
-    content = _extract_geotiff_content(response.content)
-    target_index = target_month.year - baseline_start if target_is_baseline else -1
-    with tempfile.TemporaryDirectory(prefix="zetriklim_spi_raster_") as temp:
-        folder = Path(temp)
-        input_path = folder / "stack.tif"
-        boundary_path = folder / "boundary.json"
-        output_path = folder / "spi.tif"
-        input_path.write_bytes(content)
-        _write_boundary_json(gdf, boundary_path)
-        return _run_raster_worker(
-            [
-                sys.executable,
-                "-m",
-                "zetriklim.raster_worker",
-                "spi-from-stack",
-                str(input_path),
-                str(boundary_path),
-                str(output_path),
-                "--target-index",
-                str(target_index),
-                "--description",
-                f"SPI-{spi_scale} {target_month:%Y-%m}",
-                "--tags",
-                json.dumps(
-                    {
-                        "source": "CHIRPS Daily via Google Earth Engine",
-                        "method": "Gamma distribution with zero-probability correction",
-                        "baseline": f"{baseline_start}-{baseline_end}",
-                    },
-                    ensure_ascii=False,
-                ),
-            ],
-            output_path,
-            timeout=300,
-        )
+
+    content = response.content
+    if content[:2] == b"PK":
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            tif_name = next(name for name in archive.namelist() if name.lower().endswith(".tif"))
+            content = archive.read(tif_name)
+
+    with MemoryFile(content) as memory:
+        with memory.open() as src:
+            rainfall_stack = src.read().astype(np.float64)
+            profile = src.profile.copy()
+            target_index = target_month.year - baseline_start if target_is_baseline else -1
+            spi = calculate_spi_pixel_stack(rainfall_stack, target_index=target_index)
+            raster_geometry = [
+                geometry.__geo_interface__
+                for geometry in gdf.to_crs(src.crs).geometry
+            ]
+            inside = geometry_mask(
+                raster_geometry,
+                out_shape=(src.height, src.width),
+                transform=src.transform,
+                invert=True,
+            )
+            spi[~inside] = np.nan
+            profile.update(count=1, dtype="float32", nodata=-9999.0, compress="deflate")
+            output = io.BytesIO()
+            with MemoryFile() as out_memory:
+                with out_memory.open(**profile) as dst:
+                    dst.write(np.where(np.isfinite(spi), spi, -9999.0).astype("float32"), 1)
+                    dst.set_band_description(1, f"SPI-{spi_scale} {target_month:%Y-%m}")
+                    dst.update_tags(
+                        source="CHIRPS Daily via Google Earth Engine",
+                        method="Gamma distribution with zero-probability correction",
+                        baseline=f"{baseline_start}-{baseline_end}",
+                    )
+                output.write(out_memory.read())
+            return output.getvalue()
 
 
 def build_climate_geotiff(
@@ -967,17 +944,12 @@ def build_climate_geotiff(
         image = (
             ee.ImageCollection(CHIRPS_DAILY)
             .filterDate(start_date.isoformat(), end_exclusive.isoformat())
-            .sum()
-            .rename("precip_mm")
+            .mean()
+            .rename("precip_mm_day")
             .clip(geometry)
         )
         scale = CHIRPS_SCALE_M
-        description = "CHIRPS period total precipitation (mm)"
-        tags = {
-            "source": "CHIRPS Daily via Google Earth Engine",
-            "period": f"{start_date.isoformat()}/{end_date.isoformat()}",
-            "statistic": "sum",
-        }
+        description = "CHIRPS period mean daily precipitation (mm/day)"
     elif variable == "temperature":
         image = (
             ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR")
@@ -990,11 +962,6 @@ def build_climate_geotiff(
         )
         scale = 11132
         description = "ERA5-Land period mean 2m air temperature (C)"
-        tags = {
-            "source": "ERA5-Land Daily Aggregated via Google Earth Engine",
-            "period": f"{start_date.isoformat()}/{end_date.isoformat()}",
-            "statistic": "mean",
-        }
     else:
         raise ValueError(f"Desteklenmeyen iklim raster değişkeni: {variable}")
 
@@ -1009,4 +976,47 @@ def build_climate_geotiff(
     )
     response = requests.get(url, timeout=300)
     response.raise_for_status()
-    return _mask_downloaded_geotiff(response.content, gdf, description, tags)
+    content = response.content
+    if content[:2] == b"PK":
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            tif_name = next(name for name in archive.namelist() if name.lower().endswith(".tif"))
+            content = archive.read(tif_name)
+
+    with MemoryFile(content) as memory:
+        with memory.open() as src:
+            profile = src.profile.copy()
+            raster_geometry = [
+                geometry.__geo_interface__
+                for geometry in gdf.to_crs(src.crs).geometry
+            ]
+            nodata = -9999.0
+            data, transform = raster_mask(
+                src,
+                raster_geometry,
+                crop=True,
+                filled=True,
+                nodata=nodata,
+            )
+            profile.update(
+                count=1,
+                height=data.shape[1],
+                width=data.shape[2],
+                transform=transform,
+                dtype="float32",
+                nodata=nodata,
+                compress="deflate",
+            )
+            with MemoryFile() as output:
+                with output.open(**profile) as dst:
+                    dst.write(data.astype("float32"))
+                    dst.set_band_description(1, description)
+                    dst.update_tags(
+                        source=(
+                            "CHIRPS Daily via Google Earth Engine"
+                            if variable == "precipitation"
+                            else "ERA5-Land Daily Aggregated via Google Earth Engine"
+                        ),
+                        period=f"{start_date.isoformat()}/{end_date.isoformat()}",
+                        statistic="sum" if variable == "precipitation" else "mean",
+                    )
+                return output.read()

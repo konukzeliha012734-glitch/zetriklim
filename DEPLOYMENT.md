@@ -14,7 +14,7 @@ yalnızca Streamlit Secrets ekranında saklayın.
 ## 3. Streamlit Community Cloud
 
 1. https://share.streamlit.io adresinde GitHub hesabınızla giriş yapın.
-2. `Create app` seçeneğinden GitHub deposunu ve `app.py` dosyasını seçin.
+2. `Create app` seçeneğinden GitHub deposunu ve `streamlit_app.py` dosyasını seçin.
 3. App settings > Secrets alanına `.streamlit/secrets.toml.example` içindeki
    şablonu kendi değerlerinizle girin.
 4. Deploy düğmesine basın.

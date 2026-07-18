@@ -1,64 +1,43 @@
-"""GADM idari sınırlarını tez haritalarında bağlam katmanı olarak kullanır.
-
-GADM verisi yalnız çalışma sırasında indirilir. Ham veri çıktı paketine eklenmez;
-böylece GADM'nin akademik kullanım ve yeniden dağıtım koşulları korunur.
-"""
+"""GADM 4.1 ülke ve idari bölüm sınırlarını akademik kullanım için okur."""
 
 from __future__ import annotations
 
+import io
 import re
-from typing import Any
 
+import geopandas as gpd
 import requests
 
 
 GADM_VERSION = "4.1"
-GADM_LICENSE_URL = "https://gadm.org/license.html"
 GADM_BASE_URL = "https://geodata.ucdavis.edu/gadm/gadm4.1/json"
 
 
-def gadm_download_url(country_iso3: str, level: int) -> str:
-    """Doğrulanmış ISO3 ve idari düzey için resmî GADM GeoJSON adresini üretir."""
-    iso3 = str(country_iso3).strip().upper()
-    if not re.fullmatch(r"[A-Z]{3}", iso3):
+def fetch_gadm(iso3: str, level: int, timeout: int = 90) -> gpd.GeoDataFrame:
+    code = str(iso3).strip().upper()
+    if not re.fullmatch(r"[A-Z]{3}", code):
         raise ValueError("GADM ülke kodu üç harfli ISO3 biçiminde olmalıdır (ör. TUR).")
-    level = int(level)
-    if level < 0 or level > 5:
-        raise ValueError("GADM idari düzeyi 0 ile 5 arasında olmalıdır.")
-    return f"{GADM_BASE_URL}/gadm41_{iso3}_{level}.json"
-
-
-def fetch_gadm_boundaries(
-    country_iso3: str,
-    level: int = 1,
-    *,
-    timeout: int = 30,
-) -> tuple[gpd.GeoDataFrame, dict[str, Any]]:
-    """Bir ülkenin GADM sınırlarını indirir ve kaynak metadata kaydıyla döndürür."""
-    import geopandas as gpd
-
-    url = gadm_download_url(country_iso3, level)
-    response = requests.get(
-        url,
-        timeout=timeout,
-        headers={"User-Agent": "Zetriklim/1.1 academic-cartography"},
-    )
+    if int(level) not in {0, 1, 2}:
+        raise ValueError("GADM idari düzeyi 0, 1 veya 2 olmalıdır.")
+    url = f"{GADM_BASE_URL}/gadm41_{code}_{int(level)}.json"
+    response = requests.get(url, timeout=timeout)
+    if response.status_code == 404:
+        raise ValueError(f"GADM'da {code} için düzey {level} sınırı bulunamadı.")
     response.raise_for_status()
-    payload = response.json()
-    boundaries = gpd.GeoDataFrame.from_features(payload.get("features", []), crs=4326)
-    if boundaries.empty:
-        raise ValueError("GADM yanıtı geçerli idari sınır içermiyor.")
-    if boundaries.crs is None:
-        boundaries = boundaries.set_crs(4326)
-    else:
-        boundaries = boundaries.to_crs(4326)
-    metadata = {
-        "dataset": "GADM",
-        "version": GADM_VERSION,
-        "country_iso3": str(country_iso3).strip().upper(),
-        "administrative_level": int(level),
-        "source_url": url,
-        "license_url": GADM_LICENSE_URL,
-        "usage": "Akademik haritada idari bağlam; ham veri yeniden dağıtılmaz.",
-    }
-    return boundaries, metadata
+    frame = gpd.read_file(io.BytesIO(response.content))
+    if frame.empty:
+        raise ValueError("GADM yanıtı coğrafi obje içermiyor.")
+    frame.attrs.update({"source": "GADM", "version": GADM_VERSION, "url": url})
+    return frame
+
+
+def name_column(frame: gpd.GeoDataFrame, level: int) -> str:
+    preferred = f"NAME_{int(level)}"
+    if preferred in frame.columns:
+        return preferred
+    if int(level) == 0 and "COUNTRY" in frame.columns:
+        return "COUNTRY"
+    candidates = [column for column in frame.columns if str(column).startswith("NAME_")]
+    if not candidates:
+        raise ValueError("GADM verisinde idari birim adı alanı bulunamadı.")
+    return candidates[-1]

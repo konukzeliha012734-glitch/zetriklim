@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import io
-import json
-import subprocess
-import sys
 import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+
+import geopandas as gpd
+import shapefile
+from shapely.geometry import shape as shapely_shape
+
 
 REQUIRED_SHAPE_PARTS = {".shp", ".shx", ".dbf"}
 SUPPORTED_SUFFIXES = {".zip", ".shp", ".shx", ".dbf", ".prj", ".cpg", ".gpkg", ".geojson", ".json"}
@@ -43,8 +45,6 @@ class GeometrySummary:
 
     @property
     def centroid(self) -> tuple[float, float]:
-        import geopandas as gpd
-
         geom = self.gdf_wgs84[["geometry"]].dissolve().to_crs(self.area_crs).geometry.iloc[0]
         point = gpd.GeoSeries([geom.centroid], crs=self.area_crs).to_crs(4326).iloc[0]
         return point.y, point.x
@@ -96,10 +96,6 @@ def _count_vertices(geometry) -> int:
 
 
 def _read_single_shp(content: bytes, fallback_crs: str) -> gpd.GeoDataFrame:
-    import geopandas as gpd
-    import shapefile
-    from shapely.geometry import shape as shapely_shape
-
     try:
         reader = shapefile.Reader(shp=io.BytesIO(content))
         geometries = [
@@ -116,38 +112,6 @@ def _read_single_shp(content: bytes, fallback_crs: str) -> gpd.GeoDataFrame:
         geometry=geometries,
         crs=fallback_crs,
     )
-
-
-def _read_dataset_isolated(
-    dataset: Path,
-    fallback_crs: str | None = None,
-) -> tuple[gpd.GeoDataFrame, str]:
-    """Pyogrio/GDAL okumasını Rasterio yüklü ana süreçten ayrı çalıştırır."""
-    result_path = dataset.parent / "zetriklim-okunan-geometri.json"
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "zetriklim.geodata_worker",
-            "read",
-            str(dataset),
-            str(result_path),
-            "--fallback-crs",
-            fallback_crs or "",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=90,
-        check=False,
-    )
-    if completed.returncode != 0 or not result_path.exists():
-        detail = (completed.stderr or completed.stdout or "bilinmeyen GDAL hatası").strip()
-        raise GeometryUploadError(f"Coğrafi dosya güvenli işlemde okunamadı: {detail}")
-    payload = json.loads(result_path.read_text(encoding="utf-8"))
-    import geopandas as gpd
-
-    gdf = gpd.GeoDataFrame.from_features(payload["geojson"]["features"], crs=4326)
-    return gdf, str(payload["source_crs"])
 
 
 def inspect_uploaded_files(
@@ -174,46 +138,49 @@ def inspect_uploaded_files(
         non_zip_parts = [
             part for part in parts if Path(part.name).suffix.lower() not in {".zip"}
         ]
-        source_crs_override = None
         if len(shp_parts) == 1 and len(non_zip_parts) == 1:
             gdf = _read_single_shp(shp_parts[0].content, fallback_crs)
         else:
             dataset = _find_dataset(folder)
             try:
-                gdf, source_crs_override = _read_dataset_isolated(
-                    dataset,
-                    fallback_crs=fallback_crs,
-                )
+                gdf = gpd.read_file(dataset)
             except Exception as exc:
                 raise GeometryUploadError(f"Coğrafi dosya okunamadı: {exc}") from exc
 
-        if gdf.empty or gdf.geometry.is_empty.all():
-            raise GeometryUploadError("Dosya geçerli bir geometri içermiyor.")
-        if gdf.crs is None:
-            raise GeometryUploadError("Koordinat sistemi tanımlı değil. SHP için .prj dosyasını ekleyin.")
-        if not set(gdf.geom_type.dropna()).issubset({"Polygon", "MultiPolygon"}):
-            raise GeometryUploadError("Çalışma alanı Polygon veya MultiPolygon olmalı.")
+        return inspect_geodataframe(gdf)
 
-        repaired = bool((~gdf.geometry.is_valid).any())
-        if repaired:
-            gdf.geometry = gdf.geometry.make_valid()
 
-        source_crs = source_crs_override or gdf.crs.to_string()
-        gdf_wgs84 = gdf.to_crs(4326)
-        area_crs_obj = gdf_wgs84.estimate_utm_crs() or "EPSG:6933"
-        dissolved = gdf_wgs84[["geometry"]].dissolve().to_crs(area_crs_obj)
-        geometry = dissolved.geometry.iloc[0]
+def inspect_geodataframe(gdf: gpd.GeoDataFrame) -> GeometrySummary:
+    """Dosyadan veya güvenilir bir katalogdan gelen poligonları aynı kurallarla denetler."""
+    if gdf.empty or gdf.geometry.is_empty.all():
+        raise GeometryUploadError("Veri geçerli bir geometri içermiyor.")
+    if gdf.crs is None:
+        raise GeometryUploadError("Koordinat sistemi tanımlı değil.")
+    if not set(gdf.geom_type.dropna()).issubset({"Polygon", "MultiPolygon"}):
+        raise GeometryUploadError("Çalışma alanı Polygon veya MultiPolygon olmalı.")
 
-        return GeometrySummary(
-            gdf_wgs84=gdf_wgs84,
-            area_km2=float(geometry.area / 1_000_000),
-            perimeter_km=float(geometry.length / 1_000),
-            source_crs=source_crs,
-            area_crs=str(area_crs_obj),
-            feature_count=len(gdf_wgs84),
-            vertex_count=sum(_count_vertices(g) for g in gdf_wgs84.geometry),
-            was_repaired=repaired,
-        )
+    gdf = gdf.copy()
+    repaired = bool((~gdf.geometry.is_valid).any())
+    if repaired:
+        gdf.geometry = gdf.geometry.make_valid()
+    gdf = gdf[~gdf.geometry.is_empty & gdf.geometry.notna()].copy()
+
+    source_crs = gdf.crs.to_string()
+    gdf_wgs84 = gdf.to_crs(4326)
+    area_crs_obj = gdf_wgs84.estimate_utm_crs() or "EPSG:6933"
+    dissolved = gdf_wgs84[["geometry"]].dissolve().to_crs(area_crs_obj)
+    geometry = dissolved.geometry.iloc[0]
+
+    return GeometrySummary(
+        gdf_wgs84=gdf_wgs84,
+        area_km2=float(geometry.area / 1_000_000),
+        perimeter_km=float(geometry.length / 1_000),
+        source_crs=source_crs,
+        area_crs=str(area_crs_obj),
+        feature_count=len(gdf_wgs84),
+        vertex_count=sum(_count_vertices(g) for g in gdf_wgs84.geometry),
+        was_repaired=repaired,
+    )
 
 
 def inspect_zipped_shapefile(content: bytes) -> GeometrySummary:
